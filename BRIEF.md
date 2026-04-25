@@ -93,17 +93,21 @@ The shape is deliberate. The contribution is the interface plus a reference impl
 
 **Secondary contribution: Apple Silicon support for PRM scoring.** The existing `LocalVllmProcessRewardModel` requires CUDA via vLLM, which excludes Apple Silicon hardware. To run the trajectory-scoring step of section 6 on M4 Max, we add `MLXProcessRewardModel`, a sibling implementation of `AbstractProcessRewardModel` backed by MLX with 4-bit quantized weights. This is not a contribution to the aggregator interface but it is a contribution to the library: it removes a hardware constraint that affects any user trying to develop or test PRM-consuming algorithms locally on a Mac. `LocalVllmProcessRewardModel` continues to work unchanged on its existing CUDA path.
 
+**Trajectory corpus pipeline as an sdg_hub flow.** Trajectory generation, PRM scoring, answer extraction, and correctness verification are expressed as an sdg_hub flow living at `learned-aggregator/flows/trajectory_corpus.yaml` rather than as a one-off Python script. This integrates the second library required by the assignment and makes corpus construction composable, reproducible, and amenable to swapping in different policies, PRMs, or filters without rewriting glue code. The flow uses three built-in blocks (`PromptBuilderBlock`, `RowMultiplierBlock`, `LLMChatBlock`) and adds two project-specific blocks: `MLXProcessRewardScoreBlock` (delegates to the `MLXProcessRewardModel` from above to score per-step) and `MathVerifyAnswerBlock` (extracts `\boxed{...}` and runs `math_verify` against ground truth). The two custom blocks ship in the project repo as a small secondary contribution to the sdg_hub block ecosystem.
+
 ## 6. Data plan
 
 **Question source.** Math problems from the MATH dataset's train split. The MATH500 evaluation set is held entirely out of trajectory generation so that section 7's evaluation is uncontaminated.
 
-**Trajectory generation protocol.**
+**Trajectory generation protocol.** Implemented as the sdg_hub flow described in section 5 (`learned-aggregator/flows/trajectory_corpus.yaml`). Block sequence:
 
-- Policy: Qwen2.5-1.5B-Instruct, fixed across the project.
-- Sampling: temperature 0.7, $N = 8$ trajectories per problem.
-- Step decomposition: existing `StepGeneration` with `"\n\n"` as the step boundary.
-- Step scoring: Qwen2.5-Math-PRM-7B at 4-bit quantization, served through the new `MLXProcessRewardModel` from section 5. Scores persist with the trajectory.
-- Final-answer extraction: regex against `\boxed{...}`. Correctness verified via `math_verify`.
+1. `PromptBuilderBlock`: wraps each MATH problem in the math system prompt.
+2. `RowMultiplierBlock`: fans out to $N = 8$ trajectories per problem.
+3. `LLMChatBlock`: rolls out the policy (Qwen2.5-1.5B-Instruct) at temperature 0.7. Step boundary is `"\n\n"`, consistent with its_hub's existing `StepGeneration` convention so trajectories are interoperable with downstream its_hub algorithms.
+4. `MLXProcessRewardScoreBlock` (custom): scores each step with Qwen2.5-Math-PRM-7B at 4-bit, delegating to the `MLXProcessRewardModel` from section 5. Per-step scores persist as a list field on the row.
+5. `MathVerifyAnswerBlock` (custom): extracts `\boxed{...}` via regex and runs `math_verify` against the problem's ground-truth answer. Emits both the extracted answer and a boolean correctness label.
+
+The output dataset has columns `problem`, `trajectory_text`, `step_scores`, `extracted_answer`, `correct`, plus the original problem metadata (difficulty level). This is the input to aggregator training and to the held-out evaluation in section 7.
 
 **Corpus size.** 200 problems times 8 trajectories per problem yields 1,600 trajectories, with roughly 1,120 in the training split after a 70/15/15 problem-level partition. The reduction from a notional 500-problem corpus is compute-driven, not statistical: PRM scoring on M4 Max via the 4-bit MLX wrapper runs at roughly 0.3 to 0.7 seconds per step, and 200 problems keeps wall-clock for the scoring pass under two hours at the upper end of that range. The MLP is correspondingly reduced to hidden width 16 (about 465 parameters), which keeps the absolute hypothesis space modest at the smaller absolute data scale. The sample-to-parameter ratio is essentially unchanged from a 500-problem regime; both regimes sit well below the classical 10:1 heuristic, and the actual safety mechanisms are not the headline ratio. Three factors carry that load. The input space is a fixed 10-dimensional feature vector rather than a learned representation, so effective capacity is materially below raw parameter count. Training uses early stopping on validation loss, which determines the effective parameter count actually fit to the data. The train-validation gap is reported in section 7, and capacity is rolled back to width 8 or weight decay is added if the gap exceeds 5 percentage points in absolute accuracy.
 
@@ -153,6 +157,7 @@ The project ships at any of three levels. Each tier represents a defensible subm
 **Minimum.** Everything required to call the project complete:
 
 - `AbstractTrajectoryAggregator` plus `HardcodedAggregator` wrapping current behavior, with `ParticleFiltering` accepting it as a parameter and the default reproducing current numerics.
+- The sdg_hub trajectory corpus flow runnable end-to-end on at least one problem, with the two custom blocks (`MLXProcessRewardScoreBlock`, `MathVerifyAnswerBlock`) implemented and tested.
 - One trained `LearnedMLPAggregator` checkpoint.
 - Selection accuracy comparing all three baselines plus the learned MLP on at least one stratification slice with confidence intervals.
 - README sections required by the assignment rubric.
@@ -167,7 +172,7 @@ The project ships at any of three levels. Each tier represents a defensible subm
 **Stretch.** Anything beyond target that strengthens defense without distracting from the core claim:
 
 - LSTM aggregator side-by-side with MLP, conditional on the saturation criteria in section 7.
-- Cross-policy transfer: aggregator trained on policy A's trajectories evaluated on policy B's, where B differs in size or family.
+- Cross-policy transfer using training_hub: produce policy B by LoRA-fine-tuning Qwen2.5-1.5B with training_hub on a small targeted dataset, then evaluate the aggregator (trained on policy A's trajectories) on policy B's. This brings the third library into the contribution. The cost is real: training_hub's backends assume CUDA, so on M4 Max this is high-risk and may need to be skipped if executing it would compromise the core deliverable. We attempt it only after the target tier is shipped.
 
 The plan is to aim at target. Minimum exists so a partially completed project still ships cleanly under unforeseen pressure. Stretch exists so there is somewhere defined to go if data collection runs ahead of schedule.
 

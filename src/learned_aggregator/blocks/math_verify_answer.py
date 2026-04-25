@@ -1,0 +1,84 @@
+"""MathVerifyAnswerBlock — sdg_hub block for answer extraction and correctness labelling."""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+import pandas as pd
+from pydantic import Field
+from sdg_hub.core.blocks.base import BaseBlock
+from sdg_hub.core.blocks.registry import BlockRegistry
+
+_BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}")
+
+
+def _extract_boxed(text: str) -> str | None:
+    """Return the last \\boxed{...} content, or None if absent."""
+    matches = _BOXED_RE.findall(text)
+    return matches[-1].strip() if matches else None
+
+
+def _is_correct(predicted: str | None, ground_truth: str) -> bool:
+    if predicted is None:
+        return False
+    try:
+        from math_verify import parse, verify
+
+        return bool(verify(parse(predicted), parse(ground_truth)))
+    except Exception:
+        return predicted.strip() == ground_truth.strip()
+
+
+@BlockRegistry.register(
+    "MathVerifyAnswerBlock",
+    category="verification",
+    description=(
+        "Extracts the final \\boxed{} answer from a trajectory and verifies it "
+        "against ground truth using math_verify (falls back to string equality)."
+    ),
+)
+class MathVerifyAnswerBlock(BaseBlock):
+    """Extracts and verifies the final answer from a reasoning trajectory.
+
+    Input columns:
+    - ``trajectory_text``: the full model-generated solution text.
+    - ``ground_truth``: the reference answer string (may itself contain \\boxed{}).
+
+    Output columns:
+    - ``extracted_answer``: last \\boxed{...} content, or ``None``.
+    - ``correct``: ``True`` if ``extracted_answer`` matches ``ground_truth``
+      (via ``math_verify`` when available, string equality otherwise).
+    """
+
+    extracted_answer_col: str = Field(
+        default="extracted_answer",
+        description="Name of the output column for the extracted answer.",
+    )
+    correct_col: str = Field(
+        default="correct",
+        description="Name of the output column for the boolean correctness label.",
+    )
+
+    def generate(self, samples: pd.DataFrame, **kwargs: Any) -> pd.DataFrame:
+        trajectory_col = self.input_cols[0]
+        gt_col = self.input_cols[1]
+
+        extracted: list[str | None] = []
+        correct: list[bool] = []
+
+        for _, row in samples.iterrows():
+            trajectory_text: str = str(row[trajectory_col])
+            ground_truth: str = str(row[gt_col])
+
+            # Ground truth may itself be wrapped in \boxed{}
+            gt_answer = _extract_boxed(ground_truth) or ground_truth.strip()
+            pred_answer = _extract_boxed(trajectory_text)
+
+            extracted.append(pred_answer)
+            correct.append(_is_correct(pred_answer, gt_answer))
+
+        out = samples.copy()
+        out[self.extracted_answer_col] = extracted
+        out[self.correct_col] = correct
+        return out

@@ -1,0 +1,10 @@
+# Prompt template for math trajectory generation.
+# Used by PromptBuilderBlock; Jinja2 templating with {{ problem }} variable.
+
+- role: system
+  content: |
+    Please reason step by step, and put your final answer within \boxed{}.
+
+- role: user
+  content: |
+    {{ problem }}

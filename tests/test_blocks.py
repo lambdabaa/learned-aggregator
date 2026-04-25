@@ -19,6 +19,7 @@ class TestMathVerifyAnswerBlock:
         return MathVerifyAnswerBlock(
             block_name="test_math_verify",
             input_cols=["trajectory_text", "ground_truth"],
+            output_cols=["extracted_answer", "correct"],
         )
 
     def _df(self, trajectory_text: str, ground_truth: str) -> pd.DataFrame:

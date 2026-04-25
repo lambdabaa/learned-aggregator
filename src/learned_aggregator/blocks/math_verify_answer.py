@@ -51,18 +51,12 @@ class MathVerifyAnswerBlock(BaseBlock):
       (via ``math_verify`` when available, string equality otherwise).
     """
 
-    extracted_answer_col: str = Field(
-        default="extracted_answer",
-        description="Name of the output column for the extracted answer.",
-    )
-    correct_col: str = Field(
-        default="correct",
-        description="Name of the output column for the boolean correctness label.",
-    )
-
     def generate(self, samples: pd.DataFrame, **kwargs: Any) -> pd.DataFrame:
         trajectory_col = self.input_cols[0]
         gt_col = self.input_cols[1]
+        # output_cols[0] = extracted_answer column name, output_cols[1] = correct column name
+        answer_col = self.output_cols[0]
+        correct_col = self.output_cols[1]
 
         extracted: list[str | None] = []
         correct: list[bool] = []
@@ -79,6 +73,6 @@ class MathVerifyAnswerBlock(BaseBlock):
             correct.append(_is_correct(pred_answer, gt_answer))
 
         out = samples.copy()
-        out[self.extracted_answer_col] = extracted
-        out[self.correct_col] = correct
+        out[answer_col] = extracted
+        out[correct_col] = correct
         return out

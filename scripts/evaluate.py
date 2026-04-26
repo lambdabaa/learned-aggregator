@@ -138,7 +138,7 @@ def evaluate_aggregator(
     n_values: list[int],
 ) -> dict:
     """Evaluate one aggregator across stratifications."""
-    results = {"overall": {}, "by_length": {}, "by_n": {}}
+    results = {"overall": {}, "by_length": {}, "by_n": {}, "by_difficulty": {}}
 
     for n in n_values:
         outcomes = [select_best(r.get("trajectories", []), agg_fn, n) for r in records
@@ -169,6 +169,22 @@ def evaluate_aggregator(
     for bucket, outcomes in by_len.items():
         lo, hi = bootstrap_ci(outcomes)
         results["by_length"][bucket] = {
+            "acc": float(np.mean(outcomes)), "ci_lo": lo, "ci_hi": hi,
+            "n_problems": len(outcomes),
+        }
+
+    # By MATH difficulty level (Level 1–5 from the dataset)
+    by_diff: dict[str, list[float]] = {}
+    for r in records:
+        trajs = r.get("trajectories", [])
+        if not trajs:
+            continue
+        level = str(r.get("level", "unknown")).strip() or "unknown"
+        correct = select_best(trajs, agg_fn, len(trajs))
+        by_diff.setdefault(level, []).append(float(correct))
+    for level, outcomes in sorted(by_diff.items()):
+        lo, hi = bootstrap_ci(outcomes)
+        results["by_difficulty"][level] = {
             "acc": float(np.mean(outcomes)), "ci_lo": lo, "ci_hi": hi,
             "n_problems": len(outcomes),
         }

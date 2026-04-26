@@ -79,7 +79,7 @@ Trains with Adam, early stopping on validation loss (patience=10).
 ## Data
 
 - **Policy:** Qwen2.5-1.5B-Instruct at temperature 0.7
-- **PRM:** Qwen2.5-Math-PRM-7B at 4-bit quantisation via `MLXProcessRewardModel`
+- **PRM:** Qwen2.5-Math-PRM-7B via `TransformersProcessRewardModel` (MPS/fp16 on Apple Silicon)
 - **Problems:** 200 from MATH train split (MATH500 held out entirely)
 - **Trajectories:** N=8 per problem
 - **Split:** 70/15/15 problem-level (train/val/test), seed=42
@@ -94,7 +94,7 @@ The canonical data pipeline is expressed as an `sdg_hub` Flow at
 | 1 | `PromptBuilderBlock` (`build_math_prompt`) | Wraps each problem in the Qwen step-by-step system prompt (`flows/prompts/math_system.yaml`) |
 | 2 | `RowMultiplierBlock` (`fan_out_trajectories`) | Fans out each problem row to N=8 trajectory candidates |
 | 3 | `LLMChatBlock` (`generate_trajectory`) | Generates each trajectory with the policy LLM (async, temperature=0.7) |
-| 4 | `MLXProcessRewardScoreBlock` (`score_steps`) | Scores each reasoning step prefix with the PRM; writes `step_scores: list[float]` |
+| 4 | `ProcessRewardScoreBlock` (`score_steps`) | Scores all reasoning steps in one forward pass via `TransformersProcessRewardModel` (MPS/fp16); writes `step_scores: list[float]` |
 | 5 | `MathVerifyAnswerBlock` (`verify_answer`) | Extracts `\boxed{}` answer; labels `correct: bool` against `ground_truth` |
 
 `scripts/generate_trajectories.py` is a thin runner: it imports the custom blocks
@@ -159,13 +159,21 @@ cd learned-aggregator
 pip install -e ".[dev]"          # installs its_hub as a local dependency
 ```
 
-### 2. Start the vLLM server (for trajectory generation)
+### 2. Start the policy LLM server
 
+**Apple Silicon (its-iaas):**
+```bash
+its-iaas --host 0.0.0.0 --port 8100 &
+# Then configure it: see docs/iaas-service.md in the its_hub repo
+# Or point generate_trajectories.py at any OpenAI-compatible v1 endpoint.
+```
+
+**Linux with CUDA (vLLM):**
 ```bash
 vllm serve Qwen/Qwen2.5-1.5B-Instruct --port 8100
 ```
 
-### 3. Generate trajectories (Apple Silicon, requires MLX)
+### 3. Generate trajectories
 
 The pipeline is defined in `flows/trajectory_corpus.yaml`.
 `scripts/generate_trajectories.py` is a thin runner that loads the flow,
@@ -214,28 +222,43 @@ result = pf.infer(lm, problem, budget=16)
 
 ## Reproduction on CUDA hardware
 
-The only Apple-Silicon-specific component is `MLXProcessRewardModel`.
-On a CUDA host, replace it with:
+`TransformersProcessRewardModel` supports both MPS (Apple Silicon) and CUDA.
+On a CUDA host, construct it with `device="cuda"`:
 
 ```python
-from its_hub.integration import LocalVllmProcessRewardModel
-from reward_hub.base import AggregationMethod
-prm = LocalVllmProcessRewardModel(
+from its_hub.integration import TransformersProcessRewardModel
+prm = TransformersProcessRewardModel(
     model_name="Qwen/Qwen2.5-Math-PRM-7B",
     device="cuda",
-    aggregation_method=AggregationMethod.LAST,
 )
 ```
 
-Then pass `prm` to `generate_trajectories.py` via code.  The JSONL format
-and training/evaluation scripts are identical.
+Or set the `backend` field in `ProcessRewardScoreBlock` — it defaults to
+`"transformers"` which auto-uses the correct device.
 
-## Secondary Contribution: MLXProcessRewardModel
+For the corpus pipeline at full scale (500 problems, CUDA):
+```bash
+python scripts/generate_trajectories.py \
+    --lm-endpoint http://localhost:8100/v1 \
+    --lm-model Qwen/Qwen2.5-1.5B-Instruct \
+    --prm-model Qwen/Qwen2.5-Math-PRM-7B \
+    --num-problems 500 \
+    --output-dir data/trajectories_full
+```
 
-`its_hub/integration/mlx_prm.py` implements `AbstractProcessRewardModel`
-using MLX on Apple Silicon.  It removes the CUDA dependency for local
-PRM-scoring development on macOS.  `LocalVllmProcessRewardModel` continues
-to work unchanged on its existing CUDA path.
+The JSONL format and training/evaluation scripts are identical.
+
+## Secondary Contribution: Apple Silicon PRM Support
+
+`TransformersProcessRewardModel` (`its_hub/integration/transformers_prm.py`)
+implements the correct scoring algorithm for Qwen2.5-Math-PRM-7B:
+one forward pass → 2-class softmax at each `<extra_0>` position.
+It runs on MPS (Apple Silicon), CUDA, or CPU — removing the CUDA-only
+constraint of `LocalVllmProcessRewardModel` for local development.
+
+`MLXProcessRewardModel` (`its_hub/integration/mlx_prm.py`) is also provided
+for Math-Shepherd-style PRMs that use generative "+"/"-" token scoring
+(not for Qwen2.5-Math-PRM-7B, which uses a classifier head).
 
 ## Stretch: Cross-Policy Transfer via training_hub
 

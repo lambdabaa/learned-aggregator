@@ -1,3 +1,6 @@
+__pycache__/
+.claude/skills/
+
 # Gas City
 .beads/*
 !.beads/config.yaml

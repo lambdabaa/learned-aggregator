@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: learned_aggregator
+Version: 0.1.0
+Summary: Learned trajectory aggregation for process reward models
+Requires-Python: >=3.10
+Requires-Dist: its_hub @ file://../its_hub
+Requires-Dist: torch>=2.0.0
+Requires-Dist: numpy
+Requires-Dist: scikit-learn>=1.3.0
+Requires-Dist: tqdm>=4.65.0
+Requires-Dist: math-verify>=0.1.0
+Requires-Dist: sdg-hub @ file://../sdg_hub

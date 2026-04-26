@@ -1,21 +1,23 @@
-"""Train a TrajectoryMLP aggregator on scored trajectory data.
+"""Train a trajectory aggregator on scored trajectory data.
 
-Loads JSONL files produced by generate_trajectories.py, extracts fixed-length
-features from each trajectory's step_scores, and trains a 2-layer MLP with
-binary cross-entropy loss and early stopping on validation loss.
+Supports two model types (--model):
 
-Saves the trained checkpoint to its_hub/aggregators/checkpoints/mlp_agg.pt
-in a format compatible with LearnedMLPAggregator.
+  mlp   2-layer MLP trained with BCE + early stopping (default).
+        Saves a .pt checkpoint loadable by LearnedMLPAggregator.
+
+  gbdt  Gradient-boosted decision trees via sklearn.
+        Saves a .pkl checkpoint loadable by _make_gbdt_agg in evaluate.py.
 
 Usage:
     python scripts/train_aggregator.py \\
-        --data-dir data/trajectories \\
-        --checkpoint-out ../../its_hub/its_hub/aggregators/checkpoints/mlp_agg.pt \\
-        --hidden-width 16 \\
-        --lr 1e-3 \\
-        --epochs 200 \\
-        --patience 10 \\
-        --seed 42
+        --data-dir data/trajectories_combined \\
+        --model mlp --hidden-width 8 \\
+        --checkpoint-out ../../its_hub/its_hub/aggregators/checkpoints/mlp_agg_h8.pt
+
+    python scripts/train_aggregator.py \\
+        --data-dir data/trajectories_combined \\
+        --model gbdt \\
+        --checkpoint-out ../../its_hub/its_hub/aggregators/checkpoints/gbdt_agg.pkl
 """
 
 import argparse
@@ -57,7 +59,7 @@ def load_jsonl(path: str) -> list[dict]:
 
 
 def build_dataset(records: list[dict]) -> tuple[np.ndarray, np.ndarray]:
-    """Convert problem records → (features, labels) arrays."""
+    """Convert problem records → (feature_vectors, labels) arrays for MLP/GBDT."""
     features_list: list[np.ndarray] = []
     labels_list: list[float] = []
     for rec in records:
@@ -70,6 +72,29 @@ def build_dataset(records: list[dict]) -> tuple[np.ndarray, np.ndarray]:
     X = np.stack(features_list).astype(np.float32)
     y = np.array(labels_list, dtype=np.float32)
     return X, y
+
+
+def build_sequence_dataset(records: list[dict]) -> tuple[list[list[float]], np.ndarray]:
+    """Convert problem records → (raw_sequences, labels) for LSTM."""
+    sequences: list[list[float]] = []
+    labels: list[float] = []
+    for rec in records:
+        for traj in rec.get("trajectories", []):
+            step_scores = traj.get("step_scores", [])
+            sequences.append(step_scores if step_scores else [0.5])
+            labels.append(1.0 if traj.get("is_correct", False) else 0.0)
+    return sequences, np.array(labels, dtype=np.float32)
+
+
+def _pad_sequences(sequences: list[list[float]]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad variable-length sequences → (padded_tensor, lengths)."""
+    lengths = torch.tensor([len(s) for s in sequences], dtype=torch.int64)
+    max_len = int(lengths.max().item())
+    padded = torch.zeros(len(sequences), max_len, 1)
+    for i, seq in enumerate(sequences):
+        t = torch.tensor(seq, dtype=torch.float32)
+        padded[i, : len(seq), 0] = t
+    return padded, lengths
 
 
 # ---------------------------------------------------------------------------
@@ -188,14 +213,131 @@ def print_weight_profile(model: TrajectoryMLP, feature_names: list[str]) -> None
 # Entry point
 # ---------------------------------------------------------------------------
 
+def train_lstm(
+    train_seqs: list[list[float]],
+    y_train: np.ndarray,
+    val_seqs: list[list[float]],
+    y_val: np.ndarray,
+    hidden_size: int = 8,
+    lr: float = 1e-3,
+    epochs: int = 200,
+    patience: int = 10,
+    batch_size: int = 64,
+    seed: int = 42,
+    checkpoint_out: str = "lstm_agg.pt",
+) -> None:
+    from src.learned_aggregator.model import TrajectoryLSTM
+
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+    model = TrajectoryLSTM(hidden_size=hidden_size)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.BCELoss()
+
+    X_train_pad, L_train = _pad_sequences(train_seqs)
+    X_val_pad, L_val = _pad_sequences(val_seqs)
+    y_train_t = torch.tensor(y_train)
+    y_val_t = torch.tensor(y_val)
+
+    n = len(train_seqs)
+    best_val_loss, best_state, no_improve = float("inf"), None, 0
+
+    for epoch in tqdm(range(epochs), desc="Training"):
+        model.train()
+        idx = torch.randperm(n)
+        for start in range(0, n, batch_size):
+            b = idx[start : start + batch_size]
+            xb, lb = X_train_pad[b], L_train[b]
+            yb = y_train_t[b]
+            optimizer.zero_grad()
+            criterion(model(xb, lb), yb).backward()
+            optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            train_preds = model(X_train_pad, L_train).numpy()
+            train_loss = float(criterion(torch.tensor(train_preds), y_train_t))
+            train_acc = _accuracy(train_preds, y_train)
+            val_preds = model(X_val_pad, L_val)
+            val_loss = float(criterion(val_preds, y_val_t))
+            val_acc = _accuracy(val_preds.numpy(), y_val)
+
+        if (epoch + 1) % 20 == 0 or epoch == 0:
+            print(f"Epoch {epoch+1:3d} | train_loss={train_loss:.4f} train_acc={train_acc:.3f} "
+                  f"| val_loss={val_loss:.4f} val_acc={val_acc:.3f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print(f"Early stopping at epoch {epoch+1} (patience={patience})")
+                break
+
+    if best_state:
+        model.load_state_dict(best_state)
+
+    model.eval()
+    with torch.no_grad():
+        train_acc = _accuracy(model(X_train_pad, L_train).numpy(), y_train)
+        val_acc = _accuracy(model(X_val_pad, L_val).numpy(), y_val)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"\nFinal: train_acc={train_acc:.3f} | val_acc={val_acc:.3f} | "
+          f"gap={train_acc - val_acc:.3f} | params={n_params}")
+
+    os.makedirs(os.path.dirname(os.path.abspath(checkpoint_out)), exist_ok=True)
+    torch.save({"state_dict": model.state_dict(), "hidden_size": hidden_size}, checkpoint_out)
+    print(f"Checkpoint saved to {checkpoint_out}")
+
+
+def train_gbdt(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    seed: int = 42,
+    checkpoint_out: str = "gbdt_agg.pkl",
+) -> None:
+    import joblib
+    from sklearn.ensemble import GradientBoostingClassifier
+
+    clf = GradientBoostingClassifier(
+        n_estimators=200,
+        max_depth=3,
+        learning_rate=0.05,
+        subsample=0.8,
+        random_state=seed,
+    )
+    clf.fit(X_train, y_train.astype(int))
+
+    train_acc = clf.score(X_train, y_train.astype(int))
+    val_acc = clf.score(X_val, y_val.astype(int))
+    print(f"\nFinal: train_acc={train_acc:.3f} | val_acc={val_acc:.3f} | gap={train_acc - val_acc:.3f}")
+
+    os.makedirs(os.path.dirname(os.path.abspath(checkpoint_out)), exist_ok=True)
+    joblib.dump(clf, checkpoint_out)
+    print(f"Checkpoint saved to {checkpoint_out}")
+
+    print("\nFeature importances (Gini):")
+    ranked = sorted(zip(FEATURE_NAMES, clf.feature_importances_), key=lambda x: -x[1])
+    for name, imp in ranked:
+        bar = "█" * int(imp * 200)
+        print(f"  {name:20s} {imp:.4f}  {bar}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default="data/trajectories",
                         help="Directory containing train.jsonl, val.jsonl")
+    parser.add_argument("--model", choices=["mlp", "gbdt", "lstm"], default="mlp")
     parser.add_argument(
         "--checkpoint-out",
-        default=str(Path(__file__).parent.parent.parent /
-                    "its_hub/its_hub/aggregators/checkpoints/mlp_agg.pt"),
+        default=None,
+        help="Output path (.pt for mlp, .pkl for gbdt). Auto-detected if omitted.",
     )
     parser.add_argument("--hidden-width", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -204,6 +346,11 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    ckpt_dir = Path(__file__).parent.parent.parent / "its_hub/its_hub/aggregators/checkpoints"
+    if args.checkpoint_out is None:
+        suffix = {"mlp": "mlp_agg.pt", "gbdt": "gbdt_agg.pkl", "lstm": "lstm_agg.pt"}
+        args.checkpoint_out = str(ckpt_dir / suffix[args.model])
 
     train_path = os.path.join(args.data_dir, "train.jsonl")
     val_path = os.path.join(args.data_dir, "val.jsonl")
@@ -216,21 +363,34 @@ def main() -> None:
     X_val, y_val = build_dataset(load_jsonl(val_path))
     print(f"  {len(X_val)} trajectories, {y_val.mean():.2%} correct")
 
-    print(f"\nTraining MLP (hidden_width={args.hidden_width}, lr={args.lr}, "
-          f"epochs={args.epochs}, patience={args.patience})")
-
-    model = train(
-        X_train, y_train, X_val, y_val,
-        hidden_width=args.hidden_width,
-        lr=args.lr,
-        epochs=args.epochs,
-        patience=args.patience,
-        batch_size=args.batch_size,
-        seed=args.seed,
-        checkpoint_out=args.checkpoint_out,
-    )
-
-    print_weight_profile(model, FEATURE_NAMES)
+    if args.model == "lstm":
+        print(f"\nTraining LSTM (hidden_size={args.hidden_width}, lr={args.lr}, "
+              f"epochs={args.epochs}, patience={args.patience})")
+        train_seqs, y_tr = build_sequence_dataset(load_jsonl(train_path))
+        val_seqs, y_v = build_sequence_dataset(load_jsonl(val_path))
+        train_lstm(train_seqs, y_tr, val_seqs, y_v,
+                   hidden_size=args.hidden_width, lr=args.lr,
+                   epochs=args.epochs, patience=args.patience,
+                   batch_size=args.batch_size, seed=args.seed,
+                   checkpoint_out=args.checkpoint_out)
+    elif args.model == "gbdt":
+        print("\nTraining GBDT (n_estimators=200, max_depth=3, lr=0.05, subsample=0.8)")
+        train_gbdt(X_train, y_train, X_val, y_val,
+                   seed=args.seed, checkpoint_out=args.checkpoint_out)
+    else:
+        print(f"\nTraining MLP (hidden_width={args.hidden_width}, lr={args.lr}, "
+              f"epochs={args.epochs}, patience={args.patience})")
+        model = train(
+            X_train, y_train, X_val, y_val,
+            hidden_width=args.hidden_width,
+            lr=args.lr,
+            epochs=args.epochs,
+            patience=args.patience,
+            batch_size=args.batch_size,
+            seed=args.seed,
+            checkpoint_out=args.checkpoint_out,
+        )
+        print_weight_profile(model, FEATURE_NAMES)
 
 
 if __name__ == "__main__":

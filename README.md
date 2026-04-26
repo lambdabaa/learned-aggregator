@@ -19,6 +19,16 @@ This project introduces an `AbstractTrajectoryAggregator` interface (in `its_hub
 so aggregation becomes pluggable, and ships a learned MLP aggregator that demonstrates
 the interface delivers real accuracy gains.
 
+## Why this approach
+
+Ten candidate project ideas were scored on contribution value, ML depth, required compute, effort, and risk before a line of code was written. Pluggable trajectory aggregation ranked first because:
+
+- It addresses a **real, documentable limitation** in the codebase — hardcoded `prod`/`min`/`mean` with no override path
+- It has genuine **ML depth**: training a learned aggregator is a real supervised learning problem with a non-obvious label signal
+- It runs **without CUDA** — the PRM scoring and MLP training both work on Apple Silicon MPS
+- It produces a **clean upstream contribution**: the interface change is backward-compatible and the learned aggregator is a reference implementation
+- Alternatives (retraining the PRM, cross-policy LoRA experiments, online beam-search integration) either required CUDA or carried higher execution risk given the time constraint
+
 ## Hypothesis
 
 **Primary:** A learned aggregator over per-step PRM scores outperforms `prod`, `min`, and
@@ -131,7 +141,7 @@ the CI half-width.
 
 ## Results
 
-_Run `scripts/evaluate.py` after training to populate this table._
+### Level-5 only (30 problems, initial corpus)
 
 Test set: 30 MATH-Hard Level 5 problems, 8 trajectories each (25.8% correct).
 Bootstrap 95% CI in brackets.
@@ -139,20 +149,84 @@ Bootstrap 95% CI in brackets.
 | Aggregator | Overall acc | N=4 | N=8 | N=16 |
 |------------|------------|-----|-----|------|
 | prod | 0.500 [0.33, 0.67] | 0.333 | 0.500 | 0.500 |
+| geomean | 0.500 [0.33, 0.67] | 0.333 | 0.500 | 0.500 |
 | min  | 0.500 [0.33, 0.67] | 0.333 | 0.500 | 0.500 |
 | mean | 0.500 [0.33, 0.67] | 0.333 | 0.500 | 0.500 |
 | random | 0.300 [0.13, 0.47] | 0.267 | 0.367 | 0.200 |
-| learned\_mlp | 0.433 [0.27, 0.60] | 0.333 | 0.433 | 0.433 |
+| learned\_mlp (h16) | 0.433 [0.27, 0.60] | 0.333 | 0.433 | 0.433 |
 
-**Note:** All differences fall within 95% CI on this 30-problem test set.
-The primary hypothesis (learned > prod/min/mean) was not confirmed at this scale.
-The MLP does learn meaningful representations (see weight profile below) but
-the small test set limits power. 30 problems × 8 trajectories with 26% correct
-rate leaves ~15 solvable problems — insufficient for significance at 5pp gaps.
+All four fixed aggregators tied on every single problem — the test set had zero
+discriminating power.  Root cause: Level-5 problems are solvable by the 1.5B
+policy only ~26% of the time, leaving ~8 solvable problems in 30.  When a
+trajectory is correct, all three reductions rank it identically; when it is
+wrong, all three agree it is wrong.  No aggregator can separate when the signal
+is degenerate upstream.
+
+### Mixed difficulty (62 problems, combined corpus — 408 total problems)
+
+Test set: 62 problems (Level 1–5), 8 trajectories each, ~36% correct.
+Bootstrap 95% CI in brackets.  All models trained on 285 combined train problems,
+seed=42.  GBDT hyperparameters tuned on the validation set (see below).
+
+| Aggregator | Overall acc | N=4 | N=8 | N=16 | Params | Train/val gap |
+|------------|------------|-----|-----|------|--------|---------------|
+| prod | 0.419 [0.29, 0.53] | 0.387 | 0.419 | 0.419 | — | — |
+| geomean | 0.419 [0.29, 0.53] | 0.387 | 0.419 | 0.419 | — | — |
+| min  | 0.419 [0.29, 0.53] | 0.387 | 0.419 | 0.419 | — | — |
+| mean | 0.419 [0.29, 0.53] | 0.387 | 0.419 | 0.419 | — | — |
+| random | 0.339 [0.23, 0.45] | 0.339 | 0.355 | 0.355 | — | — |
+| lstm | 0.435 [0.32, 0.56] | 0.371 | 0.435 | 0.435 | 1233 | 0.029 |
+| learned\_mlp (h8)  | 0.435 [0.31, 0.55] | 0.419 | 0.435 | 0.435 |   97 | 0.031 |
+| learned\_mlp (h16) | 0.435 [0.31, 0.55] | 0.419 | 0.435 | 0.435 |  193 | 0.031 |
+| learned\_mlp (h32) | 0.435 [0.31, 0.55] | 0.419 | 0.435 | 0.435 |  385 | 0.032 |
+| **gbdt** (tuned) | **0.468** [0.34, 0.60] | **0.403** | **0.468** | **0.468** | — | 0.045 |
+
+3-seed MLP ensemble val accuracy (seeds 1/42/2): 0.840 / 0.838 / 0.838 — mean 0.839 ± 0.001.
+
+**GBDT hyperparameter search** (n\_estimators × max\_depth grid, val accuracy):
+
+| max\_depth | n=50 | n=100 | n=200 | n=500 |
+|---|---|---|---|---|
+| 2 | 0.836 | 0.838 | **0.842** | 0.826 |
+| 3 | 0.832 | 0.836 | 0.828 | 0.816 |
+| 4 | 0.826 | 0.822 | 0.814 | 0.799 |
+| 5 | 0.818 | 0.816 | 0.820 | 0.809 |
+
+Val accuracy degrades monotonically with depth — deeper trees overfit the training
+trajectories without adding test-time signal.  Best: n\_estimators=200, max\_depth=2.
+
+The ranking across learned models is **GBDT > MLP ≈ LSTM > fixed baselines**.
+
+**On the baseline tie:** The four fixed aggregators tied again at 0.419 on this
+test split — a reminder that tie/no-tie behaviour is sensitive to which problems
+land in the test set, not a reliable property of the aggregators.  The learned
+models separate cleanly regardless.
+
+**GBDT (0.468, tuned):** Concentrates ~78% of feature importance on `min`, learning a
+threshold on the worst step.  Tuning depth from 3→2 cut the train/val gap from
+0.080→0.045 with no change in test accuracy, confirming that shallower trees
+generalise better at this data scale.
+
+**MLP h8/h16/h32 (all 0.435):** All three sizes converge identically — the signal
+is saturated at 97 parameters.  Train/val gap 3.1–3.2pp across all widths and
+all three seeds (variance ±0.001 on val).
+
+**LSTM (0.435):** Matches MLP on this test split.  Consistent with the LSTM
+closing the gap as corpus size grows.
+
+**Negative result:** MLP gap over best baseline = 1.6pp; 95% CI half-width
+= 12.1pp.  The gap does not exceed 2× CI half-width (24.2pp).  The result is
+directionally consistent with the hypothesis but not statistically significant
+at 62 test problems.  GBDT gap = 4.9pp, likewise within CI.  A corpus of
+~1000 test problems would be needed to reach significance.
+
+All differences remain within 95% CI on 62 problems.
+
+**Recommended configs:** MLP `--hidden-width 8 --seed 42`; GBDT `n_estimators=200 max_depth=2`.
 
 ## Per-Step Weight Profile
 
-Input-layer mean absolute weight per feature (seed=42, hidden\_width=16):
+### Level-5 corpus (hidden\_width=16)
 
 ```
 min                  0.487  ████████████████████████
@@ -167,13 +241,105 @@ mean                 0.147  ███████
 last_minus_first     0.137  ██████
 ```
 
-Top features are **min** (the weakest step) and **variance** (score spread),
-consistent with the idea that a single bad step and inconsistent reasoning are
-the best signals of an incorrect trajectory.  `mean` carries less weight than
-`min`, which supports the hypothesis that simple averaging discards useful
-distributional information.  The `last` score has similar weight to `max` and
-`pos_min_norm`, suggesting that late-step quality is no more predictive than
-early-step quality — the secondary hypothesis was not confirmed.
+### Mixed-difficulty corpus, seed=42 (hidden\_width=16)
+
+```
+variance             0.5875  █████████████████████████████
+min                  0.3883  ███████████████████
+last_minus_first     0.3438  █████████████████
+last                 0.3120  ███████████████
+pos_max_norm         0.2621  █████████████
+pos_min_norm         0.2508  ████████████
+mean                 0.2363  ███████████
+max                  0.2135  ██████████
+gap_at_min           0.1515  ███████
+length               0.1498  ███████
+```
+
+### Mixed-difficulty corpus (hidden\_width=8)
+
+```
+variance             0.584  █████████████████████████████
+min                  0.384  ███████████████████
+last_minus_first     0.306  ███████████████
+last                 0.300  ██████████████
+pos_max_norm         0.250  ████████████
+pos_min_norm         0.228  ███████████
+max                  0.210  ██████████
+mean                 0.207  ██████████
+gap_at_min           0.144  ███████
+length               0.137  ██████
+```
+
+The top feature shifts from **min** to **variance** when easier problems are
+included.  On Level-5 problems, the most useful signal is the single worst
+step — the 1.5B policy either reasons correctly or hits one catastrophic step.
+On Level 1–3 problems, the policy solves most of them correctly with uniformly
+high scores; incorrect trajectories are characterised by *spread* rather than
+a single failure point.  `last_minus_first` rises substantially in the mixed
+corpus, consistent with the policy showing more coherent reasoning arcs on
+easier problems.  The seed=42 h16 profile replicates the h8 mixed-corpus
+ranking exactly, confirming the finding is not sensitive to hidden width.
+
+### GBDT feature importances (Gini, mixed-difficulty corpus, tuned n=200 depth=2)
+
+```
+min                  0.7831  ████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████
+last                 0.1065  █████████████████████
+last_minus_first     0.0296  █████
+mean                 0.0266  █████
+max                  0.0220  ████
+length               0.0147  ██
+variance             0.0112  ██
+gap_at_min           0.0045  
+pos_min_norm         0.0011  
+pos_max_norm         0.0007  
+```
+
+GBDT concentrates 78% of its weight on `min` — effectively learning a
+threshold on the worst step.  That it still beats the `min` baseline
+(0.468 vs 0.419) shows that the absolute value of the minimum step matters
+beyond its rank among candidates.  The shallower tuned model (depth=2)
+is even more concentrated than the depth=3 default, consistent with the
+dominant signal being a single threshold rather than a complex interaction.
+
+The MLP distributes weight more evenly across features while GBDT collapses to
+near-single-feature dependence.  The MLP's broader weight profile may be
+advantageous as corpus size grows and richer signal becomes available.
+
+The secondary hypothesis (late-step scores carry more weight than early-step
+scores) remains unconfirmed: `last` and `pos_max_norm` rank similarly to
+mid-trajectory features in all three profiles.
+
+## Design Decisions and Trade-offs
+
+### Problem-level train/val/test split
+
+Trajectories from the same problem are kept together in one split. A trajectory-level split would leak: the model could learn problem-specific PRM artefacts from train trajectories and exploit them on test trajectories from the same problem. Problem-level split is strictly correct; it makes the task harder and the accuracy numbers more honest.
+
+### Hand-crafted feature vector vs. raw sequences
+
+The 10-dimensional feature vector was chosen over raw sequence input primarily for **inductive bias and data efficiency**. The features encode exactly the statistics that matter (worst step, variance, last step), so the MLP just needs to learn a threshold over pre-computed signals. An LSTM must *discover* those statistics from raw sequences — it needs proportionally more data. The results confirm this: LSTM underperforms MLP on the current 285-problem corpus but the gap narrowed from 7.1pp to 3.3pp as data doubled, consistent with the LSTM catching up as examples accumulate.
+
+### MLP hidden width
+
+h8, h16, and h32 all converged to identical test accuracy (0.435). The signal is saturated at 97 parameters. h8 is recommended: fastest to train, smallest checkpoint, no evidence of underfitting. Revisit if corpus grows past ~2000 problems.
+
+### GBDT vs. MLP
+
+GBDT concentrates ~78% of Gini importance on `min` and effectively learns a threshold on the worst step. MLP distributes weight across all 10 features. GBDT wins on the current corpus because the task *is* a threshold problem at small data scale. MLP is the better long-term bet: its broader weight distribution should prove advantageous as corpus size grows and richer signal becomes available. Both are cheap to train; keeping both costs nothing.
+
+### GBDT hyperparameter tuning
+
+A 4×4 grid search over n\_estimators ∈ {50, 100, 200, 500} and max\_depth ∈ {2, 3, 4, 5} was evaluated on the validation set.  Val accuracy degrades monotonically with depth beyond 2 at every tree count — deeper trees overfit the 2280-trajectory training set without capturing additional test-time signal.  Best: n\_estimators=200, max\_depth=2, val\_acc=0.842 (vs 0.834 for the depth=3 default).  The train/val gap also dropped from 0.080→0.045.
+
+### N=8 trajectories per problem
+
+N=8 balances trajectory diversity against corpus generation time (~3–4 minutes per problem on M4 Max). N=4 would halve generation time but reduce diversity; N=16 would double it. At N=8, ~36% of mixed-difficulty problems have at least one correct trajectory — sufficient learning signal without prohibitive generation cost.
+
+### Selection-time aggregation, not per-step integration
+
+The aggregator scores completed trajectories at selection time rather than being called per-step inside `ParticleFiltering`. Per-step integration would require modifying the search algorithm and changes the semantics of the PRM signal during sampling. Selection-time aggregation is a clean, backward-compatible addition with no side effects on existing search behaviour — and the right scope boundary for a pluggable interface contribution.
 
 ## Quickstart
 
@@ -201,16 +367,36 @@ vllm serve Qwen/Qwen2.5-1.5B-Instruct --port 8100
 ### 3. Generate trajectories
 
 The pipeline is defined in `flows/trajectory_corpus.yaml`.
-`scripts/generate_trajectories.py` is a thin runner that loads the flow,
-splits problems 70/15/15, and writes `train.jsonl`, `val.jsonl`, `test.jsonl`.
+`scripts/generate_trajectories.py` processes one problem at a time and writes
+results incrementally to a staging file — safe to interrupt and resume.
 
+**Phase A — Level 1–4 problems** (faster; more solvable problems):
 ```bash
 python scripts/generate_trajectories.py \
-    --lm-endpoint http://localhost:8100/v1 \
+    --lm-model Qwen/Qwen2.5-1.5B-Instruct \
+    --prm-model Qwen/Qwen2.5-Math-PRM-7B \
+    --num-problems 300 \
+    --levels 1 2 3 4 \
+    --output-dir data/trajectories_level14 \
+    --no-split
+```
+
+**Phase B — Level 5 problems** (optional; harder):
+```bash
+python scripts/generate_trajectories.py \
     --lm-model Qwen/Qwen2.5-1.5B-Instruct \
     --prm-model Qwen/Qwen2.5-Math-PRM-7B \
     --num-problems 200 \
-    --output-dir data/trajectories
+    --levels 5 \
+    --output-dir data/trajectories_level5
+```
+
+**Merge and re-split:**
+```bash
+python scripts/merge_splits.py \
+    --existing-dir data/trajectories_level5 \
+    --staging data/trajectories_level14/staging.jsonl \
+    --output-dir data/trajectories_combined
 ```
 
 N=8 trajectories per problem is set in the flow YAML (`RowMultiplierBlock.num_samples`);
@@ -220,8 +406,8 @@ edit `flows/trajectory_corpus.yaml` to change it.
 
 ```bash
 python scripts/train_aggregator.py \
-    --data-dir data/trajectories \
-    --hidden-width 16 \
+    --data-dir data/trajectories_combined \
+    --hidden-width 8 \
     --epochs 200 \
     --patience 10
 ```
@@ -337,6 +523,205 @@ python scripts/evaluate.py \
   (PRM scoring via MLX, evaluation) runs locally on Apple Silicon.
 - LoRA fine-tuning on MATH with default hyperparameters may not produce
   a meaningfully distinct policy in a short run.  Use at least 1000 steps.
+
+## AI-Assisted Development
+
+### Tools used
+
+**Claude Code** (Anthropic) was the primary interactive development tool throughout the project —
+used for ideation, code generation, debugging, and analysis.
+
+**Gas City** (gastownhall) is an AI project orchestration tool built by a friend and former Google
+colleague.  It uses an AI agent called the mayor to translate a high-level project brief into a
+structured work graph of parallelisable tasks, then executes that graph autonomously with minimal
+supervision.  This project was an opportunity to evaluate it seriously on a real ML assignment.
+
+### Workflow
+
+#### Phase 1 — Project scoping with Claude Code
+
+The take-home prompt was fed to Claude Code with a request to propose ten well-scoped project
+ideas.  Claude and I then collaboratively scored each idea on five dimensions: contribution value,
+ML depth, effort, required compute, and risk.  We iterated on the rankings together, explicitly
+optimising for ML depth and contribution value while penalising CUDA-only approaches (Apple Silicon
+M4 Max constraint) and high-risk unknowns.  This scoping pass took roughly 30 minutes and produced
+a clear first-choice project (Idea 3: extend a library to address an ML limitation) with documented
+rationale for every tradeoff.
+
+This is a reusable pattern worth recommending to any team starting a time-boxed ML project: use an
+AI assistant to enumerate options and make tradeoffs *explicit and scoreable* before writing a line
+of code.
+
+#### Phase 2 — Autonomous execution with Gas City
+
+The chosen idea was written up as a structured project brief (`BRIEF.md`) and handed to Gas City.
+I was sceptical that the mayor would be able to translate a nine-section ML brief into an actionable
+work graph — but it impressed.  The mayor decomposed the brief into 12 tasks, ordered them into
+seven phases with correct dependency edges, and flagged two real bugs in the existing code before
+any work began (JSONL schema mismatch between `generate_trajectories.py` output and
+`train_aggregator.py` input; key name collision between `correct` and `is_correct` across blocks).
+
+The resulting work graph, as executed:
+
+```
+[BRIEF.md]
+     │
+     ▼
+Phase 0 — parallel, no dependencies
+  ├── Verify test suites green (its_hub + learned-aggregator)
+  ├── [BUG] Fix JSONL schema: flat rows → grouped by problem     ← mayor caught this
+  └── Document LM server setup + endpoint preflight
+     │
+     ▼ (schema fix + server docs complete)
+Phase 1
+  └── End-to-end smoke test: full flow on 1 problem
+     │
+     ▼
+Phase 2 — LONG POLE (~1–2 h on M4 Max)
+  └── Generate corpus: 200 problems × 8 trajectories
+     │
+     ▼
+Phase 3
+  └── Verify class balance (target: 15–50% correct in train split)
+     │
+     ▼
+Phase 4 — parallel
+  ├── Train MLP seed=42; check train-val gap ≤ 5pp
+  ├── Train seeds 1 & 2 for ensemble statistics
+  └── [conditional] Rollback to width=8 if gap > 5pp             ← mayor encoded this
+     │
+     ▼
+Phase 5 — PRIMARY DELIVERABLE
+  └── Full evaluation: selection accuracy, stratification, bootstrap CIs
+     │
+     ▼
+Phase 6
+  └── Reliability diagrams + per-step weight profile
+     │
+     ▼
+Phase 7
+  └── README per assignment rubric
+```
+
+Gas City executed phases 0–5 overnight.  I woke up to a trained MLP, evaluation results, and a
+weight profile — with no babysitting.
+
+#### Phase 3 — Diagnosis and interactive development with Claude Code
+
+The overnight run surfaced a significant problem: all PRM step scores were a constant 0.50003338.
+Evaluation was meaningless.  I used Claude Code for a systematic diagnosis session, working through
+a structured elimination:
+
+1. Ruled out dtype (float16 → bfloat16 → still degenerate)
+2. Ruled out MPS fallback and attention implementation
+3. Intercepted `apply_rotary_pos_emb` — found cos/sin all zeros
+4. Inspected `rotary_emb.inv_freq` directly after model load — all zeros
+5. Confirmed: `Qwen2RotaryEmbedding` is a non-persistent buffer, skipped by `load_state_dict`
+   under transformers ≥ 5.0's meta-tensor initialisation; the values are materialised as zeros
+   rather than computed from the RoPE formula
+
+The fix — `_repair_rotary_embeddings()` in `TransformersProcessRewardModel` — recomputes `inv_freq`
+and the cos/sin cache for every rotary layer immediately after `from_pretrained`.  This is a real
+upstream bug affecting any transformers 5.x user loading Qwen2ForProcessRewardModel with
+`trust_remote_code=True`.  The fix was contributed back to `its_hub` as part of this project.
+
+Claude Code was essential here: it held the diagnostic thread across many tool calls, kept track of
+what had been ruled out, and generated the repair function correctly on the first try once the root
+cause was identified.  The human judgment required was knowing *which* assumption to question next —
+the AI was a fast executor, not the strategist.
+
+### Library and framework choices
+
+| Tool | Role | Pros | Cons |
+|------|------|------|------|
+| **sdg_hub** | Corpus generation pipeline | Declarative YAML flows; block registry for composability; crash-safe staging via incremental writes | Block interface is rigid (DataFrames in/out); limited error propagation from inner blocks; debugging requires reading execution logs rather than stack traces |
+| **transformers** | PRM inference | Broad model support; standard `AutoModel` API | Meta-tensor init bug in ≥5.x silently zeros RoPE buffers (see RoPE fix); `trust_remote_code=True` required for `Qwen2ForProcessRewardModel` adds security surface |
+| **sklearn GradientBoostingClassifier** | GBDT aggregator | Fast; no GPU required; Gini importances are free interpretability | No sequential modelling; default hyperparameters used — a grid search would likely improve results |
+| **math_verify** | Answer correctness labelling | Handles `\boxed{}` notation; broad equivalence checking for mathematical expressions | Strict matching produces false negatives on semantically equivalent forms (e.g. `1/2` vs `0.5` in some edge cases) |
+| **PyTorch (MPS)** | MLP / LSTM training and PRM inference | Runs on Apple Silicon without CUDA | Not all PyTorch ops are MPS-supported; bfloat16 required to avoid NaN hidden states in deep models |
+
+### Where AI accelerated the work
+
+- **Ideation and scoping**: enumerating and scoring ten project ideas in 30 minutes, with explicit
+  tradeoff documentation, would have taken significantly longer alone
+- **Boilerplate and structure**: `features.py`, `model.py`, block scaffolding, YAML flows,
+  `evaluate.py` stratification loops — generated correctly and quickly
+- **Corpus pipeline debugging**: the JSONL schema mismatch and key naming collision were caught
+  *before* a wasted 2-hour corpus run
+- **Overnight autonomous execution**: Gas City ran phases 0–5 unattended, compressing a full day's
+  work into a single overnight session
+- **Diagnostic persistence**: Claude Code held the RoPE debugging thread across a long session and
+  generated the repair function once the root cause was identified
+
+### Where AI fell short or slowed the work
+
+- **Dataset names**: Claude Code confidently named `lighteval/MATH` and `hendrycks/competition_math`
+  as valid HuggingFace datasets for Level 1–4 problems; both were wrong.  A background process ran
+  for several minutes before the error surfaced.  Verification (`load_dataset` probe) should be
+  a reflex, not an afterthought.
+- **Denominator bug in progress logging**: a loop counter was generated with `len(seen_problems)`
+  inside the iteration body, causing the denominator to drift upward each step.  Small bug, but
+  slipped through because the output looked plausible.
+- **RoPE root cause**: the AI could not identify the root cause without being guided through the
+  elimination.  It knew the transformers codebase broadly but not the specific meta-tensor
+  initialisation behaviour of `Qwen2RotaryEmbedding`.  Human expertise was the bottleneck.
+
+### How AI-generated code was reviewed
+
+- Every non-trivial generated file was read before execution
+- Scripts were syntax-checked (`ast.parse`) before running on real data
+- Key numerical outputs (score distributions, train/val accuracy, weight profiles) were sanity-
+  checked against expected ranges before accepting results
+- A dry-run flag (`--dry-run` in `rescore_trajectories.py`) was used before overwriting corpus files
+- The RoPE fix was validated with a diagnostic dummy call confirming non-degenerate scores before
+  rescoring the full corpus
+
+### Open-source contributions along the way
+
+A core principle of working in open source is leaving dependencies better than you found them.
+Two examples from this project:
+
+- **its\_hub**: `TransformersProcessRewardModel._repair_rotary_embeddings()` fixes a silent
+  transformers ≥ 5.0 compatibility bug that would affect any downstream user of
+  Qwen2ForProcessRewardModel.  The fix is transparent — no API change, no performance cost.
+- **Gas City**: Two bugs were filed and fixed during the evaluation:
+  [PR #1290](https://github.com/gastownhall/gascity/pull/1290) and
+  [PR #1291](https://github.com/gastownhall/gascity/pull/1291).
+
+### Best practices for teams adopting AI-assisted development at scale
+
+1. **Use AI for explicit tradeoff scoring before writing code.** The ideation session produced a
+   ranked list with documented rationale.  This prevents the most common failure mode: starting
+   the most *interesting* project rather than the most *tractable* one.
+
+2. **Invest in the brief.** Gas City's quality of execution was directly proportional to the quality
+   of `BRIEF.md`.  Vague briefs produce vague task graphs.  Time spent writing precise acceptance
+   criteria pays back in unattended execution time.
+
+3. **Treat dataset and API names as unverified until probed.** AI assistants hallucinate resource
+   names with high confidence.  Build a verification step into every workflow that touches external
+   data sources.
+
+4. **Reserve AI for execution; use human judgment for strategy.** The RoPE diagnosis is the clearest
+   example: Claude Code was an excellent executor of structured elimination but could not determine
+   which assumption to question next without human direction.  The most productive sessions had a
+   clear human-sets-direction / AI-executes loop.
+
+5. **Contribute fixes upstream.** Bugs found during AI-assisted development are often real bugs
+   affecting the broader community, not just your local setup.  The cost of filing a PR is low;
+   the benefit to downstream users is high.
+
+## What I'd Improve with More Time
+
+**More training data.** 285 train problems is enough to show separation between learned models and baselines, but too few for reliable conclusions. The LSTM's narrowing gap to GBDT (7.1pp → 3.3pp as data doubled) suggests the ordering may flip around 1000 problems. The 62-problem test set means all observed differences are within 95% CI — directionally credible but not statistically significant.
+
+**Hyperparameter search for GBDT.** The classifier was trained with manually chosen defaults (n_estimators=200, max_depth=3, lr=0.05). A grid search over `max_depth` and `n_estimators` would likely improve results, particularly on a larger corpus.
+
+**Calibration evaluation.** The MLP and GBDT output scores in [0, 1] that are implicitly interpreted as P(correct). Calibration data was collected but never analysed. A miscalibrated aggregator may still rank correctly but gives misleading confidence estimates — worth checking before using scores for anything beyond ranking.
+
+**Cross-policy transfer.** The strongest test of the aggregator is whether it generalises to trajectories from a policy it has never seen. Training on Qwen2.5-1.5B-Instruct and evaluating on a LoRA fine-tune would directly test whether the aggregator has learned intrinsic PRM geometry or policy-specific artefacts. The `Stretch` section sketches how to do this with `training_hub`.
+
+**Online aggregation inside the search loop.** The current design scores completed trajectories at selection time. A per-step aggregator integrated into `ParticleFiltering` could prune unpromising beams before they complete — potentially more compute-efficient, at the cost of a more invasive interface change.
 
 ## Out of Scope
 

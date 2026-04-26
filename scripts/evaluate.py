@@ -52,6 +52,57 @@ def _mean_agg(step_scores: list[float]) -> float:
     return sum(step_scores) / len(step_scores) if step_scores else 0.0
 
 
+def _geomean(step_scores: list[float]) -> float:
+    """Geometric mean — length-corrected prod that doesn't penalise long chains."""
+    if not step_scores:
+        return 0.0
+    log_sum = sum(math.log(max(s, 1e-9)) for s in step_scores)
+    return math.exp(log_sum / len(step_scores))
+
+
+def _make_lstm_agg(checkpoint_path: str) -> Callable[[list[float]], float]:
+    import torch
+    import torch.nn as nn
+    from torch.nn.utils.rnn import pack_padded_sequence
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    hidden_size = checkpoint.get("hidden_size", 8)
+
+    class _LSTM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lstm = nn.LSTM(input_size=1, hidden_size=hidden_size, batch_first=True)
+            self.head = nn.Linear(hidden_size, 1)
+        def forward(self, x, lengths):
+            packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+            _, (h_n, _) = self.lstm(packed)
+            return torch.sigmoid(self.head(h_n[-1])).squeeze(-1)
+
+    net = _LSTM()
+    net.load_state_dict(checkpoint["state_dict"])
+    net.eval()
+
+    def score(step_scores: list[float]) -> float:
+        seq = step_scores if step_scores else [0.5]
+        x = torch.tensor(seq, dtype=torch.float32).view(1, -1, 1)
+        lengths = torch.tensor([len(seq)], dtype=torch.int64)
+        with torch.no_grad():
+            return float(net(x, lengths).item())
+
+    return score
+
+
+def _make_gbdt_agg(checkpoint_path: str) -> Callable[[list[float]], float]:
+    import joblib
+    clf = joblib.load(checkpoint_path)
+
+    def score(step_scores: list[float]) -> float:
+        feat = extract_features(step_scores)
+        return float(clf.predict_proba([feat])[0, 1])
+
+    return score
+
+
 def _random_agg(step_scores: list[float]) -> float:
     return random.random()
 
@@ -236,6 +287,8 @@ def main() -> None:
         default=str(Path(__file__).parent.parent.parent /
                     "its_hub/its_hub/aggregators/checkpoints/mlp_agg.pt"),
     )
+    parser.add_argument("--gbdt-checkpoint", default=None,
+                        help="Path to gbdt_agg.pkl (auto-detected sibling of --checkpoint if omitted)")
     parser.add_argument("--output", default="results/eval.json")
     parser.add_argument("--n-values", nargs="+", type=int, default=[4, 8, 16])
     parser.add_argument("--seed", type=int, default=42)
@@ -250,6 +303,7 @@ def main() -> None:
 
     aggregators: dict[str, Callable] = {
         "prod": _prod,
+        "geomean": _geomean,
         "min": _min_agg,
         "mean": _mean_agg,
         "random": _random_agg,
@@ -259,6 +313,17 @@ def main() -> None:
         print(f"Loaded LearnedMLP from {args.checkpoint}")
     else:
         print(f"Warning: checkpoint not found at {args.checkpoint}, skipping learned_mlp")
+
+    ckpt_dir = Path(args.checkpoint).resolve().parent
+    gbdt_path = args.gbdt_checkpoint or str(ckpt_dir / "gbdt_agg.pkl")
+    if os.path.exists(gbdt_path):
+        aggregators["gbdt"] = _make_gbdt_agg(gbdt_path)
+        print(f"Loaded GBDT from {gbdt_path}")
+
+    lstm_path = str(ckpt_dir / "lstm_agg.pt")
+    if os.path.exists(lstm_path):
+        aggregators["lstm"] = _make_lstm_agg(lstm_path)
+        print(f"Loaded LSTM from {lstm_path}")
 
     all_results: dict = {}
     for name, agg_fn in aggregators.items():

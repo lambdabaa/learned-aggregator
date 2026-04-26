@@ -79,7 +79,7 @@ Trains with Adam, early stopping on validation loss (patience=10).
 ## Data
 
 - **Policy:** Qwen2.5-1.5B-Instruct at temperature 0.7
-- **PRM:** Qwen2.5-Math-PRM-7B via `TransformersProcessRewardModel` (MPS/fp16 on Apple Silicon)
+- **PRM:** Qwen2.5-Math-PRM-7B via `TransformersProcessRewardModel` (MPS/bfloat16 on Apple Silicon)
 - **Problems:** 200 from MATH train split (MATH500 held out entirely)
 - **Trajectories:** N=8 per problem
 - **Split:** 70/15/15 problem-level (train/val/test), seed=42
@@ -133,22 +133,47 @@ the CI half-width.
 
 _Run `scripts/evaluate.py` after training to populate this table._
 
+Test set: 30 MATH-Hard Level 5 problems, 8 trajectories each (25.8% correct).
+Bootstrap 95% CI in brackets.
+
 | Aggregator | Overall acc | N=4 | N=8 | N=16 |
 |------------|------------|-----|-----|------|
-| prod | — | — | — | — |
-| min | — | — | — | — |
-| mean | — | — | — | — |
-| random | — | — | — | — |
-| learned\_mlp | — | — | — | — |
+| prod | 0.500 [0.33, 0.67] | 0.333 | 0.500 | 0.500 |
+| min  | 0.500 [0.33, 0.67] | 0.333 | 0.500 | 0.500 |
+| mean | 0.500 [0.33, 0.67] | 0.333 | 0.500 | 0.500 |
+| random | 0.300 [0.13, 0.47] | 0.267 | 0.367 | 0.200 |
+| learned\_mlp | 0.433 [0.27, 0.60] | 0.333 | 0.433 | 0.433 |
+
+**Note:** All differences fall within 95% CI on this 30-problem test set.
+The primary hypothesis (learned > prod/min/mean) was not confirmed at this scale.
+The MLP does learn meaningful representations (see weight profile below) but
+the small test set limits power. 30 problems × 8 trajectories with 26% correct
+rate leaves ~15 solvable problems — insufficient for significance at 5pp gaps.
 
 ## Per-Step Weight Profile
 
-_Run `scripts/train_aggregator.py` to see the input-layer weight profile._
+Input-layer mean absolute weight per feature (seed=42, hidden\_width=16):
 
-The weight profile shows which features the MLP relies on most.
-Based on the `prod`-underflow hypothesis, we expect `last`, `pos_min`, and
-`gap_at_min` to carry higher weight than `mean` — reflecting that
-late-step quality and recovery from a weak step matter most.
+```
+min                  0.487  ████████████████████████
+variance             0.379  ██████████████████
+gap_at_min           0.245  ████████████
+pos_max_norm         0.233  ███████████
+pos_min_norm         0.224  ███████████
+last                 0.224  ███████████
+max                  0.221  ███████████
+length               0.157  ███████
+mean                 0.147  ███████
+last_minus_first     0.137  ██████
+```
+
+Top features are **min** (the weakest step) and **variance** (score spread),
+consistent with the idea that a single bad step and inconsistent reasoning are
+the best signals of an incorrect trajectory.  `mean` carries less weight than
+`min`, which supports the hypothesis that simple averaging discards useful
+distributional information.  The `last` score has similar weight to `max` and
+`pos_min_norm`, suggesting that late-step quality is no more predictive than
+early-step quality — the secondary hypothesis was not confirmed.
 
 ## Quickstart
 
@@ -259,6 +284,16 @@ constraint of `LocalVllmProcessRewardModel` for local development.
 `MLXProcessRewardModel` (`its_hub/integration/mlx_prm.py`) is also provided
 for Math-Shepherd-style PRMs that use generative "+"/"-" token scoring
 (not for Qwen2.5-Math-PRM-7B, which uses a classifier head).
+
+### Transformers 5.x compatibility fix
+
+`transformers ≥ 5.0` uses meta-tensor initialisation during `from_pretrained`.
+Non-persistent buffers in `Qwen2RotaryEmbedding` (`inv_freq`, `cos_cached`,
+`sin_cached`) are materialised as zeros rather than computed from the RoPE
+formula, causing every attention Q/K to be NaN and all PRM scores to collapse
+to the constant 0.50003338.  `TransformersProcessRewardModel._repair_rotary_embeddings()`
+detects and recomputes these buffers immediately after model load.
+The fix is transparent — no API change, no performance cost.
 
 ## Stretch: Cross-Policy Transfer via training_hub
 

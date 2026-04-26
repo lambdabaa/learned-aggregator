@@ -70,7 +70,9 @@ def _make_mlp_agg(checkpoint_path: str) -> Callable[[list[float]], float]:
         nn.Linear(hidden_width, 1),
         nn.Sigmoid(),
     )
-    net.load_state_dict(checkpoint["state_dict"])
+    # TrajectoryMLP wraps Sequential under self.net → strip "net." prefix
+    state = {k.removeprefix("net."): v for k, v in checkpoint["state_dict"].items()}
+    net.load_state_dict(state)
     net.eval()
 
     def score(step_scores: list[float]) -> float:

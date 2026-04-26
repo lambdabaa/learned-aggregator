@@ -70,6 +70,24 @@ def _to_df(problems: list[dict]) -> pd.DataFrame:
     ])
 
 
+def _unwrap_trajectory_text(value) -> str:
+    """Extract plain text from LLMChatBlock's message-dict output.
+
+    LLMChatBlock stores responses as [{"role": "assistant", "content": "..."}].
+    json.dumps on that list produces a JSON array, not useful text.  We extract
+    the content string here so the JSONL stores readable plain text.
+    """
+    if isinstance(value, list):
+        for msg in value:
+            if isinstance(msg, dict):
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    return content
+                if isinstance(content, list):
+                    return " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return str(value)
+
+
 def _write_jsonl(df: pd.DataFrame, path: str, split_name: str) -> None:
     """Group trajectory rows by problem and write one JSON record per problem.
 
@@ -87,7 +105,7 @@ def _write_jsonl(df: pd.DataFrame, path: str, split_name: str) -> None:
             if hasattr(step_scores, "tolist"):
                 step_scores = step_scores.tolist()
             trajectories.append({
-                "trajectory_text": str(row.get("trajectory_text", "")),
+                "trajectory_text": _unwrap_trajectory_text(row.get("trajectory_text", "")),
                 "step_scores": step_scores if isinstance(step_scores, list) else [],
                 "is_correct": bool(row.get("correct", False)),
                 "extracted_answer": row.get("extracted_answer"),
@@ -106,58 +124,26 @@ def _write_jsonl(df: pd.DataFrame, path: str, split_name: str) -> None:
     print(f"  Wrote {len(records)} problems ({len(df)} trajectory rows) to {path}")
 
 
-def _check_lm_endpoint(endpoint: str) -> None:
-    """Fail fast if the LM inference endpoint is unreachable."""
-    import urllib.request
-    import urllib.error
-
-    models_url = endpoint.rstrip("/") + "/models"
-    try:
-        with urllib.request.urlopen(models_url, timeout=5) as resp:
-            if resp.status != 200:
-                raise SystemExit(
-                    f"LM endpoint {models_url} returned HTTP {resp.status}.\n"
-                    "Start the inference server before running this script.\n"
-                    "Example: its-iaas --host 0.0.0.0 --port 8100 (or use vLLM)"
-                )
-    except urllib.error.URLError as exc:
-        raise SystemExit(
-            f"Cannot reach LM endpoint at {models_url}: {exc.reason}\n"
-            "Start the inference server before running this script.\n"
-            "Example (its-iaas):\n"
-            "  its-iaas --host 0.0.0.0 --port 8100 &\n"
-            "  # then configure: POST http://localhost:8100/configure\n"
-            "Example (vLLM on Linux/CUDA):\n"
-            "  vllm serve Qwen/Qwen2.5-1.5B-Instruct --port 8100"
-        ) from exc
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lm-endpoint", default="http://localhost:8100/v1")
-    parser.add_argument("--lm-model", default="Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument("--lm-model", default="Qwen/Qwen2.5-1.5B-Instruct",
+                        help="HuggingFace model id for the policy LLM (loaded via MLX)")
     parser.add_argument("--prm-model", default="Qwen/Qwen2.5-Math-PRM-7B")
     parser.add_argument("--num-problems", type=int, default=200)
     parser.add_argument("--output-dir", default="data/trajectories")
     parser.add_argument("--seed", type=int, default=SEED)
     args = parser.parse_args()
 
-    print(f"Checking LM endpoint at {args.lm_endpoint} ...")
-    _check_lm_endpoint(args.lm_endpoint)
-    print("  OK\n")
-
     problems = _load_math_problems(args.num_problems, args.seed)
     train_probs, val_probs, test_probs = _split(problems, args.seed)
     print(f"Split: {len(train_probs)} train / {len(val_probs)} val / {len(test_probs)} test")
 
     flow = Flow.from_yaml(FLOW_YAML)
-    flow.set_model_config(
-        model=f"openai/{args.lm_model}",
-        api_base=args.lm_endpoint,
-        api_key="NO_API_KEY",
-    )
-    # Pass the PRM model name to the scoring block at runtime
-    runtime_params = {"score_steps": {"model_name": args.prm_model}}
+    # Pass model names and global seed to the blocks at runtime
+    runtime_params = {
+        "generate_trajectory": {"model_name": args.lm_model, "global_seed": args.seed},
+        "score_steps": {"model_name": args.prm_model},
+    }
 
     for split_name, split_probs in [("train", train_probs), ("val", val_probs), ("test", test_probs)]:
         print(f"\nGenerating {split_name} split ({len(split_probs)} problems)...")

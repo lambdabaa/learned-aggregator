@@ -10,13 +10,46 @@ from pydantic import Field
 from sdg_hub.core.blocks.base import BaseBlock
 from sdg_hub.core.blocks.registry import BlockRegistry
 
-_BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}")
+_BOXED_MARKER = r"\boxed{"
 
 
 def _extract_boxed(text: str) -> str | None:
-    """Return the last \\boxed{...} content, or None if absent."""
-    matches = _BOXED_RE.findall(text)
-    return matches[-1].strip() if matches else None
+    """Return the last \\boxed{...} content with balanced brace matching.
+
+    Uses a brace-counting scan so nested braces (e.g. \\frac{a}{b},
+    \\begin{cases}) are handled correctly.
+    """
+    result = None
+    start = 0
+    while True:
+        idx = text.find(_BOXED_MARKER, start)
+        if idx == -1:
+            break
+        depth = 1
+        i = idx + len(_BOXED_MARKER)
+        while i < len(text) and depth > 0:
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+            i += 1
+        if depth == 0:
+            result = text[idx + len(_BOXED_MARKER) : i - 1]
+        start = idx + 1
+    return result.strip() if result is not None else None
+
+
+def _extract_trajectory_text(value) -> str:
+    """Unwrap LLMChatBlock message-dict output to plain text."""
+    if isinstance(value, list):
+        for msg in value:
+            if isinstance(msg, dict):
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    return content
+                if isinstance(content, list):
+                    return " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return str(value)
 
 
 def _is_correct(predicted: str | None, ground_truth: str) -> bool:
@@ -62,7 +95,7 @@ class MathVerifyAnswerBlock(BaseBlock):
         correct: list[bool] = []
 
         for _, row in samples.iterrows():
-            trajectory_text: str = str(row[trajectory_col])
+            trajectory_text: str = _extract_trajectory_text(row[trajectory_col])
             ground_truth: str = str(row[gt_col])
 
             # Ground truth may itself be wrapped in \boxed{}

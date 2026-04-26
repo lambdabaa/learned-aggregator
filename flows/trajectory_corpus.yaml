@@ -34,13 +34,15 @@ blocks:
     block_name: fan_out_trajectories
     num_samples: 8
     shuffle: false
-- block_type: LLMChatBlock
+- block_type: MLXChatBlock
   block_config:
     block_name: generate_trajectory
-    input_cols: messages
-    output_cols: trajectory_text
-    async_mode: true
+    input_cols:
+    - messages
+    output_cols:
+    - trajectory_text
     temperature: 0.7
+    max_tokens: 2048
 - block_type: ProcessRewardScoreBlock
   block_config:
     block_name: score_steps

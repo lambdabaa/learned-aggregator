@@ -1,4 +1,4 @@
-"""Tests for MLXProcessRewardScoreBlock and MathVerifyAnswerBlock."""
+"""Tests for ProcessRewardScoreBlock and MathVerifyAnswerBlock."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ class TestMathVerifyAnswerBlock:
         )
         result = block.generate(df)
         assert result["extracted_answer"].iloc[0] == "42"
-        assert result["correct"].iloc[0] is True
+        assert bool(result["correct"].iloc[0]) is True
 
     def test_wrong_answer(self):
         block = self._make_block()
@@ -43,7 +43,7 @@ class TestMathVerifyAnswerBlock:
         )
         result = block.generate(df)
         assert result["extracted_answer"].iloc[0] == "7"
-        assert result["correct"].iloc[0] is False
+        assert bool(result["correct"].iloc[0]) is False
 
     def test_no_boxed_returns_none_and_false(self):
         block = self._make_block()
@@ -53,7 +53,7 @@ class TestMathVerifyAnswerBlock:
         )
         result = block.generate(df)
         assert result["extracted_answer"].iloc[0] is None
-        assert result["correct"].iloc[0] is False
+        assert bool(result["correct"].iloc[0]) is False
 
     def test_ground_truth_itself_boxed(self):
         """Ground truth wrapped in \\boxed{} is unwrapped before comparison."""
@@ -64,7 +64,7 @@ class TestMathVerifyAnswerBlock:
         )
         result = block.generate(df)
         assert result["extracted_answer"].iloc[0] == "5"
-        assert result["correct"].iloc[0] is True
+        assert bool(result["correct"].iloc[0]) is True
 
     def test_math_verify_absent_falls_back_to_string(self):
         """When math_verify is not importable, string equality is used."""
@@ -77,7 +77,7 @@ class TestMathVerifyAnswerBlock:
         with patch.dict("sys.modules", {"math_verify": None}):
             result = block.generate(df)
         assert result["extracted_answer"].iloc[0] == "x+1"
-        assert result["correct"].iloc[0] is True
+        assert bool(result["correct"].iloc[0]) is True
 
     def test_batch_of_rows(self):
         block = self._make_block()
@@ -107,18 +107,22 @@ class TestMathVerifyAnswerBlock:
 
 
 # ---------------------------------------------------------------------------
-# MLXProcessRewardScoreBlock — mock MLXProcessRewardModel to avoid hardware
+# ProcessRewardScoreBlock — mock PRM to avoid hardware / model loading
 # ---------------------------------------------------------------------------
 
-class TestMLXProcessRewardScoreBlock:
-    """Tests run without Apple Silicon by mocking MLXProcessRewardModel."""
+class TestProcessRewardScoreBlock:
+    """Tests use the default 'transformers' backend with a mocked PRM.
 
-    _MOCK_TARGET = "learned_aggregator.blocks.mlx_prm_score.MLXProcessRewardScoreBlock._get_prm"
+    The mock's score() accepts (problem, steps: list[str]) and returns
+    list[float] — matching the TransformersProcessRewardModel interface.
+    """
+
+    _MOCK_TARGET = "learned_aggregator.blocks.prm_score.ProcessRewardScoreBlock._get_prm"
 
     def _make_block(self, step_sep: str = "\n\n"):
-        from learned_aggregator.blocks.mlx_prm_score import MLXProcessRewardScoreBlock
+        from learned_aggregator.blocks.prm_score import ProcessRewardScoreBlock
 
-        return MLXProcessRewardScoreBlock(
+        return ProcessRewardScoreBlock(
             block_name="test_prm_score",
             input_cols=["problem", "trajectory_text"],
             output_cols=["step_scores"],
@@ -126,10 +130,9 @@ class TestMLXProcessRewardScoreBlock:
         )
 
     def _mock_prm(self, scores: list[float]):
-        """Return a mock PRM whose score() cycles through the given values."""
+        """Return a mock PRM whose score(problem, steps) returns scores[:len(steps)]."""
         prm = MagicMock()
-        call_iter = iter(scores * 100)  # enough for any test
-        prm.score.side_effect = lambda prompt, response: next(call_iter)
+        prm.score.side_effect = lambda problem, steps: scores[: len(steps)]
         return prm
 
     def test_step_scores_length_matches_step_count(self):
@@ -173,8 +176,8 @@ class TestMLXProcessRewardScoreBlock:
         assert len(scores) == 1
         assert scores[0] == pytest.approx(0.75)
 
-    def test_prm_called_incrementally(self):
-        """PRM should be called once per prefix, not once per full trajectory."""
+    def test_prm_called_once_per_row(self):
+        """Transformers backend calls PRM once per trajectory (not once per step)."""
         block = self._make_block()
         mock_prm = self._mock_prm([0.8, 0.6, 0.9])
 
@@ -186,12 +189,14 @@ class TestMLXProcessRewardScoreBlock:
         with patch(self._MOCK_TARGET, return_value=mock_prm):
             block.generate(df)
 
-        # Called 3 times (one per step prefix)
-        assert mock_prm.score.call_count == 3
+        assert mock_prm.score.call_count == 1
+        # Verify all steps are passed at once
+        _, call_args, _ = mock_prm.score.mock_calls[0]
+        assert call_args[1] == ["s1", "s2", "s3"]
 
     def test_batch_of_rows(self):
         block = self._make_block()
-        mock_prm = self._mock_prm([0.5])
+        mock_prm = self._mock_prm([0.5, 0.5, 0.5])
 
         df = pd.DataFrame([
             {"problem": "q1", "trajectory_text": "a\n\nb"},
@@ -205,9 +210,9 @@ class TestMLXProcessRewardScoreBlock:
         assert len(result["step_scores"].iloc[1]) == 3
 
     def test_lazy_init_does_not_load_on_import(self):
-        """Importing the block should not trigger MLX model loading."""
-        with patch("its_hub.integration.mlx_prm.MLXProcessRewardModel") as mock_cls:
-            from learned_aggregator.blocks import MLXProcessRewardScoreBlock  # noqa: F401
+        """Importing the block should not trigger TransformersProcessRewardModel loading."""
+        with patch("its_hub.integration.transformers_prm.TransformersProcessRewardModel") as mock_cls:
+            from learned_aggregator.blocks import ProcessRewardScoreBlock  # noqa: F401
 
             mock_cls.assert_not_called()
 
@@ -215,7 +220,7 @@ class TestMLXProcessRewardScoreBlock:
         from sdg_hub.core.blocks.registry import BlockRegistry
         import learned_aggregator.blocks  # noqa: F401
 
-        block_class = BlockRegistry._get("MLXProcessRewardScoreBlock")
-        from learned_aggregator.blocks.mlx_prm_score import MLXProcessRewardScoreBlock
+        block_class = BlockRegistry._get("ProcessRewardScoreBlock")
+        from learned_aggregator.blocks.prm_score import ProcessRewardScoreBlock
 
-        assert block_class is MLXProcessRewardScoreBlock
+        assert block_class is ProcessRewardScoreBlock

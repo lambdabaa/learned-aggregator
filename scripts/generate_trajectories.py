@@ -60,22 +60,76 @@ def _split(problems: list[dict], seed: int) -> tuple[list[dict], list[dict], lis
 
 def _to_df(problems: list[dict]) -> pd.DataFrame:
     return pd.DataFrame([
-        {"problem": p["problem"], "ground_truth": p["solution"]}
-        for p in problems
+        {
+            "problem_id": idx,
+            "problem": p["problem"],
+            "ground_truth": p["solution"],
+            "level": str(p.get("level", "")),  # MATH difficulty level "Level 1"–"Level 5"
+        }
+        for idx, p in enumerate(problems)
     ])
 
 
 def _write_jsonl(df: pd.DataFrame, path: str, split_name: str) -> None:
+    """Group trajectory rows by problem and write one JSON record per problem.
+
+    The RowMultiplierBlock fans out each problem to N trajectory rows.
+    train_aggregator.py and evaluate.py expect grouped records:
+      {"problem": ..., "trajectories": [{"step_scores": ..., "is_correct": ...}, ...]}
+    """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    records = df.to_dict(orient="records")
+    records = []
+    for problem_id, group in df.groupby("problem_id", sort=True):
+        row0 = group.iloc[0]
+        trajectories = []
+        for _, row in group.iterrows():
+            step_scores = row.get("step_scores", [])
+            if hasattr(step_scores, "tolist"):
+                step_scores = step_scores.tolist()
+            trajectories.append({
+                "trajectory_text": str(row.get("trajectory_text", "")),
+                "step_scores": step_scores if isinstance(step_scores, list) else [],
+                "is_correct": bool(row.get("correct", False)),
+                "extracted_answer": row.get("extracted_answer"),
+            })
+        records.append({
+            "problem_id": int(problem_id),
+            "problem": str(row0["problem"]),
+            "ground_truth": str(row0["ground_truth"]),
+            "level": str(row0.get("level", "")),
+            "split": split_name,
+            "trajectories": trajectories,
+        })
     with open(path, "w") as f:
         for rec in records:
-            rec["split"] = split_name
-            # Ensure step_scores is JSON-serialisable (list, not numpy array)
-            if "step_scores" in rec and hasattr(rec["step_scores"], "tolist"):
-                rec["step_scores"] = rec["step_scores"].tolist()
             f.write(json.dumps(rec) + "\n")
-    print(f"  Wrote {len(records)} rows to {path}")
+    print(f"  Wrote {len(records)} problems ({len(df)} trajectory rows) to {path}")
+
+
+def _check_lm_endpoint(endpoint: str) -> None:
+    """Fail fast if the LM inference endpoint is unreachable."""
+    import urllib.request
+    import urllib.error
+
+    models_url = endpoint.rstrip("/") + "/models"
+    try:
+        with urllib.request.urlopen(models_url, timeout=5) as resp:
+            if resp.status != 200:
+                raise SystemExit(
+                    f"LM endpoint {models_url} returned HTTP {resp.status}.\n"
+                    "Start the inference server before running this script.\n"
+                    "Example: its-iaas --host 0.0.0.0 --port 8100 (or use vLLM)"
+                )
+    except urllib.error.URLError as exc:
+        raise SystemExit(
+            f"Cannot reach LM endpoint at {models_url}: {exc.reason}\n"
+            "Start the inference server before running this script.\n"
+            "Example (its-iaas):\n"
+            "  its-iaas --host 0.0.0.0 --port 8100 &\n"
+            "  # then configure: POST http://localhost:8100/configure\n"
+            "Example (vLLM on Linux/CUDA):\n"
+            "  vllm serve Qwen/Qwen2.5-1.5B-Instruct --port 8100"
+        ) from exc
 
 
 def main() -> None:
@@ -87,6 +141,10 @@ def main() -> None:
     parser.add_argument("--output-dir", default="data/trajectories")
     parser.add_argument("--seed", type=int, default=SEED)
     args = parser.parse_args()
+
+    print(f"Checking LM endpoint at {args.lm_endpoint} ...")
+    _check_lm_endpoint(args.lm_endpoint)
+    print("  OK\n")
 
     problems = _load_math_problems(args.num_problems, args.seed)
     train_probs, val_probs, test_probs = _split(problems, args.seed)

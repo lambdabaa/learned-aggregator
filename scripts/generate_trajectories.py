@@ -41,7 +41,7 @@ FLOW_YAML = os.path.join(os.path.dirname(__file__), "..", "flows", "trajectory_c
 def _load_math_problems(num_problems: int, seed: int) -> list[dict]:
     from datasets import load_dataset
 
-    ds = load_dataset("lighteval/MATH", split="train", trust_remote_code=True)
+    ds = load_dataset("lighteval/MATH-Hard", split="train")
     problems = list(ds)
     rng = random.Random(seed)
     rng.shuffle(problems)
@@ -161,6 +161,9 @@ def main() -> None:
 
     for split_name, split_probs in [("train", train_probs), ("val", val_probs), ("test", test_probs)]:
         print(f"\nGenerating {split_name} split ({len(split_probs)} problems)...")
+        if not split_probs:
+            print(f"  Skipping empty {split_name} split.")
+            continue
         df = _to_df(split_probs)
         result_df = flow.generate(df, runtime_params=runtime_params)
         out_path = os.path.join(args.output_dir, f"{split_name}.jsonl")

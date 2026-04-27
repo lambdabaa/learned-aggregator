@@ -176,6 +176,16 @@ width cannot be reliably chosen from the available data.
 defaults are fine.  MLP and LSTM width recommendations are unreliable at this
 corpus size.
 
+### Hypothesis verdicts
+
+**Primary — weakly confirmed for GBDT; sub-claims rejected.**  The overall claim (learned > fixed baselines) holds directionally for GBDT: +1.9pp over `prod`/`mean`, consistent across all 5 outer folds, though CIs overlap and the gap does not reach conventional significance.  MLP and LSTM show no edge over the fixed baselines.
+
+The two sub-claims are contradicted by the data.  The hypothesis predicted gains on *long* trajectories (where `prod` underflows), but the by-length single-split shows GBDT gains +7.6pp on medium (5–9 steps) and +6.7pp on short (≤4 steps) while gaining **nothing on long** trajectories (0.286 for both).  The "recovery after bad step" story also fails: GBDT's feature profile places 78% of weight on `min`, the same signal the `min` baseline already uses — it wins by learning a continuous threshold on the worst step, not by discounting subsequent recovery.
+
+**Secondary — weakly rejected.**  The dominant MLP features are `variance` (#1) and `min` (#2); `last` ranks 4th with no separation from other mid-trajectory features.  `last_minus_first` ranks 3rd and does capture whether the trajectory improved over time, but the primary signal is trajectory *consistency* and worst-case performance, not late-step emphasis.  GBDT has `last` as a distant second (10.6%) after `min` (78%).
+
+**What the data actually supports** — which neither hypothesis predicted — is that at this corpus size, trajectory selection is effectively a soft threshold problem on the minimum step score.  Everything else is secondary noise.  The right framing for future work is: does a larger corpus change the dominant signal away from `min`, and if so, do MLP/LSTM begin to show an edge?
+
 ### Breakdown by difficulty level
 
 Difficulty-level breakdown from the original held-out test split (62 problems),

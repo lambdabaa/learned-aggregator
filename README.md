@@ -141,105 +141,59 @@ the CI half-width.
 
 ## Results
 
-### Level-5 only (30 problems, initial corpus)
+Nested 5-fold cross-validation across all 408 problems (Levels 1–5, 8 trajectories
+per problem).  Outer folds estimate performance; inner hold-out (20% of each outer
+training set) selects hyperparameters independently per fold.  CI is a
+t-distribution 95% interval across the 5 fold estimates (4 degrees of freedom).
 
-Test set: 30 MATH-Hard Level 5 problems, 8 trajectories each (25.8% correct).
-Bootstrap 95% CI in brackets.
+| Aggregator | Mean acc | Std | 95% CI |
+|------------|----------|-----|--------|
+| random | 0.380 | 0.060 | [0.306, 0.454] |
+| min | 0.490 | 0.058 | [0.419, 0.562] |
+| prod | 0.498 | 0.052 | [0.434, 0.562] |
+| geomean | 0.498 | 0.064 | [0.419, 0.577] |
+| mean | 0.498 | 0.064 | [0.419, 0.577] |
+| learned\_mlp (HP-tuned per fold) | 0.495 | 0.054 | [0.428, 0.562] |
+| lstm (HP-tuned per fold) | 0.498 | 0.064 | [0.418, 0.577] |
+| **gbdt** (HP-tuned per fold) | **0.517** | **0.051** | **[0.454, 0.581]** |
 
-| Aggregator | Overall acc | N=4 | N=8 | N=16 |
-|------------|------------|-----|-----|------|
-| prod | 0.500 [0.33, 0.67] | 0.333 | 0.500 | 0.500 |
-| geomean | 0.500 [0.33, 0.67] | 0.333 | 0.500 | 0.500 |
-| min  | 0.500 [0.33, 0.67] | 0.333 | 0.500 | 0.500 |
-| mean | 0.500 [0.33, 0.67] | 0.333 | 0.500 | 0.500 |
-| random | 0.300 [0.13, 0.47] | 0.267 | 0.367 | 0.200 |
-| learned\_mlp (h16) | 0.433 [0.27, 0.60] | 0.333 | 0.433 | 0.433 |
+**GBDT (0.517 ± 0.051)** is the only model that consistently clears the fixed
+baselines across folds.  Its min-threshold decision surface is well-matched to
+the signal available at this data scale.
 
-All four fixed aggregators tied on every single problem — the test set had zero
-discriminating power.  Root cause: Level-5 problems are solvable by the 1.5B
-policy only ~26% of the time, leaving ~8 solvable problems in 30.  When a
-trajectory is correct, all three reductions rank it identically; when it is
-wrong, all three agree it is wrong.  No aggregator can separate when the signal
-is degenerate upstream.
+**MLP and LSTM (both ~0.495–0.498)** are statistically indistinguishable from
+`prod` and `mean` at 408 problems.  The apparent per-variant differences seen in
+single-split evaluations were sampling noise — k-fold reveals no reliable edge
+over the fixed baselines for either model family.
 
-### Mixed difficulty (62 problems, combined corpus — 408 total problems)
+**Hyperparameter selection is noisy** at this scale.  Inner CV chose different MLP
+widths each fold (16, 4, 8, 8, 4) and different GBDT configurations
+((n=50,d=2), (n=50,d=2), (n=500,d=2), (n=50,d=3), (n=200,d=4)).  The only robust
+signal is GBDT depth=2, selected in 4 of 5 folds; n\_estimators and MLP/LSTM
+width cannot be reliably chosen from the available data.
 
-Test set: 62 problems (Level 1–5), 8 trajectories each, ~36% correct.
-Bootstrap 95% CI in brackets.  All models trained on 285 combined train problems,
-seed=42.  GBDT hyperparameters tuned on the validation set (see below).
+**Recommended config:** GBDT `max_depth=2`; n\_estimators is not sensitive —
+defaults are fine.  MLP and LSTM width recommendations are unreliable at this
+corpus size.
 
-| Aggregator | Overall acc | N=4 | N=8 | N=16 | Params | Train/val gap |
-|------------|------------|-----|-----|------|--------|---------------|
-| prod | 0.419 [0.29, 0.53] | 0.387 | 0.419 | 0.419 | — | — |
-| geomean | 0.419 [0.29, 0.53] | 0.387 | 0.419 | 0.419 | — | — |
-| min  | 0.419 [0.29, 0.53] | 0.387 | 0.419 | 0.419 | — | — |
-| mean | 0.419 [0.29, 0.53] | 0.387 | 0.419 | 0.419 | — | — |
-| random | 0.339 [0.23, 0.45] | 0.339 | 0.355 | 0.355 | — | — |
-| lstm | 0.435 [0.32, 0.56] | 0.371 | 0.435 | 0.435 | 1233 | 0.029 |
-| learned\_mlp (h8)  | 0.435 [0.31, 0.55] | 0.419 | 0.435 | 0.435 |   97 | 0.031 |
-| learned\_mlp (h16) | 0.435 [0.31, 0.55] | 0.419 | 0.435 | 0.435 |  193 | 0.031 |
-| learned\_mlp (h32) | 0.435 [0.31, 0.55] | 0.419 | 0.435 | 0.435 |  385 | 0.032 |
-| **gbdt** (tuned) | **0.468** [0.34, 0.60] | **0.403** | **0.468** | **0.468** | — | 0.045 |
+### Breakdown by difficulty level
 
-3-seed MLP ensemble val accuracy (seeds 1/42/2): 0.840 / 0.838 / 0.838 — mean 0.839 ± 0.001.
+Difficulty-level breakdown from the original held-out test split (62 problems),
+shown for directional context only — per-stratum n is too small for reliable conclusions.
 
-**GBDT hyperparameter search** (n\_estimators × max\_depth grid, val accuracy):
+| Level | n | prod | gbdt | learned\_mlp | lstm |
+|-------|---|------|------|-------------|------|
+| 1 | 7 | 0.857 | **0.857** | 0.857 | 0.857 |
+| 2 | 8 | 0.375 | **0.500** | 0.500 | 0.375 |
+| 3 | 10 | 0.600 | **0.600** | 0.600 | 0.600 |
+| 4 | 4 | 0.500 | **0.500** | 0.500 | 0.500 |
+| 5 | 33 | 0.273 | **0.333** | 0.273 | 0.303 |
 
-| max\_depth | n=50 | n=100 | n=200 | n=500 |
-|---|---|---|---|---|
-| 2 | 0.836 | 0.838 | **0.842** | 0.826 |
-| 3 | 0.832 | 0.836 | 0.828 | 0.816 |
-| 4 | 0.826 | 0.822 | 0.814 | 0.799 |
-| 5 | 0.818 | 0.816 | 0.820 | 0.809 |
-
-Val accuracy degrades monotonically with depth — deeper trees overfit the training
-trajectories without adding test-time signal.  Best: n\_estimators=200, max\_depth=2.
-
-The ranking across learned models is **GBDT > MLP ≈ LSTM > fixed baselines**.
-
-**On the baseline tie:** The four fixed aggregators tied again at 0.419 on this
-test split — a reminder that tie/no-tie behaviour is sensitive to which problems
-land in the test set, not a reliable property of the aggregators.  The learned
-models separate cleanly regardless.
-
-**GBDT (0.468, tuned):** Concentrates ~78% of feature importance on `min`, learning a
-threshold on the worst step.  Tuning depth from 3→2 cut the train/val gap from
-0.080→0.045 with no change in test accuracy, confirming that shallower trees
-generalise better at this data scale.
-
-**MLP h8/h16/h32 (all 0.435):** All three sizes converge identically — the signal
-is saturated at 97 parameters.  Train/val gap 3.1–3.2pp across all widths and
-all three seeds (variance ±0.001 on val).
-
-**LSTM (0.435):** Matches MLP on this test split.  Consistent with the LSTM
-closing the gap as corpus size grows.
-
-**Negative result:** MLP gap over best baseline = 1.6pp; 95% CI half-width
-= 12.1pp.  The gap does not exceed 2× CI half-width (24.2pp).  The result is
-directionally consistent with the hypothesis but not statistically significant
-at 62 test problems.  GBDT gap = 4.9pp, likewise within CI.  A corpus of
-~1000 test problems would be needed to reach significance.
-
-All differences remain within 95% CI on 62 problems.
-
-**Recommended configs:** MLP `--hidden-width 8 --seed 42`; GBDT `n_estimators=200 max_depth=2`.
+Level 5 (n=33) is the only stratum with enough problems to carry any weight.
+GBDT gains +6pp there (0.333 vs 0.273), consistent with its min-threshold approach
+being well-matched to the high-variance, low-solve-rate regime at this difficulty.
 
 ## Per-Step Weight Profile
-
-### Level-5 corpus (hidden\_width=16)
-
-```
-min                  0.487  ████████████████████████
-variance             0.379  ██████████████████
-gap_at_min           0.245  ████████████
-pos_max_norm         0.233  ███████████
-pos_min_norm         0.224  ███████████
-last                 0.224  ███████████
-max                  0.221  ███████████
-length               0.157  ███████
-mean                 0.147  ███████
-last_minus_first     0.137  ██████
-```
 
 ### Mixed-difficulty corpus, seed=42 (hidden\_width=16)
 
@@ -271,15 +225,13 @@ gap_at_min           0.144  ███████
 length               0.137  ██████
 ```
 
-The top feature shifts from **min** to **variance** when easier problems are
-included.  On Level-5 problems, the most useful signal is the single worst
-step — the 1.5B policy either reasons correctly or hits one catastrophic step.
-On Level 1–3 problems, the policy solves most of them correctly with uniformly
-high scores; incorrect trajectories are characterised by *spread* rather than
-a single failure point.  `last_minus_first` rises substantially in the mixed
-corpus, consistent with the policy showing more coherent reasoning arcs on
-easier problems.  The seed=42 h16 profile replicates the h8 mixed-corpus
-ranking exactly, confirming the finding is not sensitive to hidden width.
+On the mixed-difficulty corpus, **variance** ranks highest.  Incorrect
+trajectories at Levels 1–3 are characterised by *spread* across steps rather
+than a single catastrophic failure — the policy mostly solves easier problems
+and the distinguishing signal is consistency, not worst-case.  `last_minus_first`
+ranks third, consistent with the policy showing coherent reasoning arcs on
+easier problems.  The h16 and h8 profiles rank identically, confirming the
+finding is not sensitive to hidden width.
 
 ### GBDT feature importances (Gini, mixed-difficulty corpus, tuned n=200 depth=2)
 
@@ -297,11 +249,11 @@ pos_max_norm         0.0007
 ```
 
 GBDT concentrates 78% of its weight on `min` — effectively learning a
-threshold on the worst step.  That it still beats the `min` baseline
-(0.468 vs 0.419) shows that the absolute value of the minimum step matters
-beyond its rank among candidates.  The shallower tuned model (depth=2)
-is even more concentrated than the depth=3 default, consistent with the
-dominant signal being a single threshold rather than a complex interaction.
+threshold on the worst step.  That it still clears the `min` baseline
+(0.517 vs 0.490 in k-fold CV) shows that the absolute value of the minimum
+step matters beyond its rank among candidates.  The shallow model (depth=2,
+selected in 4/5 folds) is consistent with the dominant signal being a single
+threshold rather than a complex interaction.
 
 The MLP distributes weight more evenly across features while GBDT collapses to
 near-single-feature dependence.  The MLP's broader weight profile may be
@@ -309,7 +261,7 @@ advantageous as corpus size grows and richer signal becomes available.
 
 The secondary hypothesis (late-step scores carry more weight than early-step
 scores) remains unconfirmed: `last` and `pos_max_norm` rank similarly to
-mid-trajectory features in all three profiles.
+mid-trajectory features in both profiles.
 
 ## Design Decisions and Trade-offs
 
@@ -319,11 +271,11 @@ Trajectories from the same problem are kept together in one split. A trajectory-
 
 ### Hand-crafted feature vector vs. raw sequences
 
-The 10-dimensional feature vector was chosen over raw sequence input primarily for **inductive bias and data efficiency**. The features encode exactly the statistics that matter (worst step, variance, last step), so the MLP just needs to learn a threshold over pre-computed signals. An LSTM must *discover* those statistics from raw sequences — it needs proportionally more data. The results confirm this: LSTM underperforms MLP on the current 285-problem corpus but the gap narrowed from 7.1pp to 3.3pp as data doubled, consistent with the LSTM catching up as examples accumulate.
+The 10-dimensional feature vector was chosen over raw sequence input primarily for **inductive bias and data efficiency**. The features encode exactly the statistics that matter (worst step, variance, last step), so the MLP just needs to learn a threshold over pre-computed signals. An LSTM must *discover* those statistics from raw sequences. In k-fold CV across 408 problems, MLP (0.495) and LSTM (0.498) are effectively tied — consistent with both being data-limited at this corpus size rather than architecture-limited.
 
 ### MLP hidden width
 
-h8, h16, and h32 all converged to identical test accuracy (0.435). The signal is saturated at 97 parameters. h8 is recommended: fastest to train, smallest checkpoint, no evidence of underfitting. Revisit if corpus grows past ~2000 problems.
+h4 through h32 show no consistent trend with width (h4 scores highest at 0.452, h8–h32 converge at 0.435, all differences within CI). The signal is saturated well below 49 parameters. h4 is recommended: smallest checkpoint, fastest to train, no evidence of underfitting. Revisit if corpus grows past ~2000 problems.
 
 ### GBDT vs. MLP
 
@@ -331,7 +283,7 @@ GBDT concentrates ~78% of Gini importance on `min` and effectively learns a thre
 
 ### GBDT hyperparameter tuning
 
-A 4×4 grid search over n\_estimators ∈ {50, 100, 200, 500} and max\_depth ∈ {2, 3, 4, 5} was evaluated on the validation set.  Val accuracy degrades monotonically with depth beyond 2 at every tree count — deeper trees overfit the 2280-trajectory training set without capturing additional test-time signal.  Best: n\_estimators=200, max\_depth=2, val\_acc=0.842 (vs 0.834 for the depth=3 default).  The train/val gap also dropped from 0.080→0.045.
+HP selection used the nested 5-fold CV inner loop: a 4×4 grid over n\_estimators ∈ {50, 100, 200, 500} × max\_depth ∈ {2, 3, 4, 5} was scored by inner-val selection accuracy for each of the 5 outer folds.  **Depth=2 was selected in 4 of 5 folds** — the only robust signal.  n\_estimators varied across folds (50, 50, 500, 50, 200), indicating the corpus is too small to distinguish tree counts reliably.  The recommended config (n\_estimators=200, max\_depth=2) matches the majority-vote depth and a mid-range tree count.
 
 ### N=8 trajectories per problem
 

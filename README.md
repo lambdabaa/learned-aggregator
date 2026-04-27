@@ -486,13 +486,13 @@ used for ideation, code generation, debugging, and analysis.
 **Gas City** (gastownhall) is an AI project orchestration tool built by a friend and former Google
 colleague.  It uses an AI agent called the mayor to translate a high-level project brief into a
 structured work graph of parallelisable tasks, then executes that graph autonomously with minimal
-supervision.  This project was an opportunity to evaluate it seriously on a real ML assignment.
+supervision.  This project was an opportunity to evaluate it seriously on a real ML workflow.
 
 ### Workflow
 
 #### Phase 1 — Project scoping with Claude Code
 
-The take-home prompt was fed to Claude Code with a request to propose ten well-scoped project
+The brief was fed to Claude Code with a request to propose ten well-scoped project
 ideas.  Claude and I then collaboratively scored each idea on five dimensions: contribution value,
 ML depth, effort, required compute, and risk.  We iterated on the rankings together, explicitly
 optimising for ML depth and contribution value while penalising CUDA-only approaches (Apple Silicon
@@ -552,7 +552,7 @@ Phase 6
      │
      ▼
 Phase 7
-  └── README per assignment rubric
+  └── README per project rubric
 ```
 
 Gas City executed phases 0–5 overnight.  I woke up to a trained MLP, evaluation results, and a
